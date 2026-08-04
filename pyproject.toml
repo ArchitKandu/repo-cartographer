@@ -9,7 +9,20 @@ dependencies = [
     "langchain-anthropic>=1.5.3",
     "pygithub>=2.9.1",
     "python-dotenv>=1.2.2",
+    "requests>=2.32.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-m 'not slow' -ra"
+markers = [
+    "slow: hits a large repo or downloads several MB; deselected by default",
+]
+# Live logs are opt-in via --log-cli-level=INFO; these only set their shape.
+log_cli_format = "%(message)s"
+log_cli_date_format = "%H:%M:%S"
+log_format = "%(message)s"
+log_level = "INFO"
 
 [dependency-groups]
 dev = [

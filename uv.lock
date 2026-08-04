@@ -1208,6 +1208,7 @@ dependencies = [
     { name = "langchain-anthropic" },
     { name = "pygithub" },
     { name = "python-dotenv" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -1223,6 +1224,7 @@ requires-dist = [
     { name = "langchain-anthropic", specifier = ">=1.5.3" },
     { name = "pygithub", specifier = ">=2.9.1" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "requests", specifier = ">=2.32.0" },
 ]
 
 [package.metadata.requires-dev]
