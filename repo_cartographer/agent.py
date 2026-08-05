@@ -9,6 +9,7 @@ knows about a repository, it learns at run time through `tools.py`.
 from deepagents import create_deep_agent
 from langchain.agents.middleware import TodoListMiddleware
 
+from repo_cartographer.middleware import RestrictToolsMiddleware
 from repo_cartographer.models import model
 from repo_cartographer.tools import get_file_contents, get_repo_tree, search_code
 
@@ -29,11 +30,9 @@ it:
 - `search_code(owner, repo, query)` — find a symbol or string across the repo
   when you know what you are looking for but not where it lives.
 
-You also have workspace tools (`ls`, `read_file`, `write_file`, `grep`, `glob`)
-and a shell (`execute`). Those act on your own scratch space, not on the
-repository, and that space starts out empty. `read_file("src/foo.py")` will
-fail: the repo is not on your disk. Reach for a repository file with
-`get_file_contents`, every time.
+You have no local filesystem and no shell. The repository is not on your disk, so
+there is nothing to `ls`, nowhere to `cd`, and no `read_file` to call — a
+repository file is reachable only through `get_file_contents`, every time.
 
 ## Method
 
@@ -52,6 +51,14 @@ fail: the repo is not on your disk. Reach for a repository file with
    your expectations.
 5. **Answer.** Give the architecture — the pieces and how they fit — and then
    where things happen: which file, and where it helps, which function or class.
+6. **Stop.** The answer is your last act. Once you have marked the final todo
+   complete, write the answer as ordinary prose in your next message and call no
+   further tools. Do not update the todo list again — a plan that is already
+   finished cannot be advanced by restating it, and an unanswered question is a
+   failed run no matter how tidy the list looks.
+
+Keep the plan to four or five todos. A longer list costs more to maintain than it
+saves.
 
 ## Rules
 
@@ -77,11 +84,17 @@ agent = create_deep_agent(
     # description from its signature and docstring, so tools.py stays the single
     # source of truth for what the model knows about them.
     tools=[get_repo_tree, get_file_contents, search_code],
-    # The planning tool (`write_todos`) is not part of deepagents' default
-    # middleware stack as of 0.7.3 — the built-in suite is the filesystem tools,
-    # `execute` and `task`. Phase 2 is about watching the agent plan before it
-    # explores, so the middleware that provides planning is added explicitly.
-    middleware=[TodoListMiddleware()],
+    middleware=[
+        # The planning tool (`write_todos`) is not part of deepagents' default
+        # middleware stack as of 0.7.3 — the built-in suite is the filesystem
+        # tools, `execute` and `task`. Phase 2 is about watching the agent plan
+        # before it explores, so planning is added explicitly.
+        TodoListMiddleware(),
+        # ...and the built-ins Phase 2 has no use for are taken away again. Last
+        # in the list so it runs after everything that injects tools. See
+        # middleware.py for why this is worth the four extra lines.
+        RestrictToolsMiddleware(),
+    ],
 )
 
 # A genuinely multi-step ask: it cannot be answered out of one file, so the agent
@@ -94,18 +107,25 @@ EXAMPLE_QUESTION = (
     "Cite the file paths you actually read."
 )
 
-# Above LangGraph's default of 25: exploring a repo costs a step per tool call,
-# and mapping a mid-sized project takes more than that.
-RECURSION_LIMIT = 40
+# Above LangGraph's default of 25: a step is spent per model turn *and* per tool
+# call, so the 9 calls a psf/requests map costs are already ~20 steps. The margin
+# is for larger repos, not for thrash — a run that spirals here is a prompt
+# problem, and raising this only hides it.
+RECURSION_LIMIT = 60
 
 
 def ask(question: str) -> str:
-    """Put one question to the cartographer and return its final answer."""
+    """Put one question to the cartographer and return its final answer as prose."""
     result = agent.invoke(
         {"messages": [{"role": "user", "content": question}]},
         config={"recursion_limit": RECURSION_LIMIT},
     )
-    return result["messages"][-1].content
+    # `.text`, not `.content`. Gemini fills `content` with a list of typed blocks —
+    # the answer plus an encrypted thought signature in `extras` — so printing
+    # `content` dumps a repr of that structure instead of the answer. OpenRouter
+    # puts a plain string there. `.text` concatenates the text blocks in both
+    # cases, which is the only shape a caller of this function wants.
+    return result["messages"][-1].text
 
 
 if __name__ == "__main__":

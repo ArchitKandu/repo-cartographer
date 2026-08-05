@@ -25,18 +25,31 @@ reasoning behind the ordering.
 | 2 | Bare agent (tools + prompt) | Done — this is what runs today |
 | 3+ | Filesystem backend, sub-agents, evals, skills | Planned |
 
-What works right now: a single agent with three GitHub tools and a planning tool,
-which can answer multi-step questions about a repository. The "write a full
-onboarding guide" product described in the implementation guide is still ahead,
-and so is everything Phase 3 onward — there is no filesystem backend, no
-sub-agent, no eval set, and no citation checking yet. Paths in the answer come
-with the prompt's instruction to cite only verified ones, not with a guarantee.
+Phase 2's definition of done — *"in the transcript, it calls the built-in planning
+tool before calling any of yours, unprompted"* — is met. On `psf/requests` with
+`gemini-3.5-flash-lite`:
 
-One caveat on Phase 2's definition of done ("it calls the planning tool before
-any of yours, unprompted"): the planning tool is wired up and the prompt asks for
-a plan first, but whether the model complies depends on which model you run. The
-3B-active model this started on never did. See
-[Notes on the model](#notes-on-the-model).
+```
+ 0. write_todos       (4 todos, unprompted, before any repository access)
+ 1. get_repo_tree     psf/requests
+ 2. write_todos       (tree step → completed)
+ 3. get_file_contents src/requests/__init__.py
+ 4. write_todos
+ 5. get_file_contents src/requests/adapters.py
+ 6. get_file_contents src/requests/sessions.py
+ 7. write_todos
+ 8. write_todos       → then answered in prose
+```
+
+Nine tool calls, no wasted ones. The answer correctly located wire-level sending
+in `adapters.py` (`HTTPAdapter.send`) and session state in `sessions.py`.
+
+What works right now: a single agent with three GitHub tools and a planning tool,
+answering multi-step questions about a repository. The "write a full onboarding
+guide" product is still ahead, and so is everything Phase 3 onward — no
+filesystem backend, no sub-agent, no eval set, no citation checking. Paths in the
+answer carry the prompt's instruction to cite only verified ones, not a
+guarantee; that guarantee is Phase 6's job.
 
 ---
 
@@ -45,7 +58,7 @@ a plan first, but whether the model complies depends on which model you run. The
 ```mermaid
 flowchart LR
     U([Your question]) --> A[Agent<br/>deepagents + LangGraph]
-    A <--> M[["LLM<br/>via OpenRouter"]]
+    A <--> M[["LLM<br/>Gemini or OpenRouter"]]
     A --> P[write_todos<br/>plan the exploration]
     A --> T{GitHub tools}
     T --> T1[get_repo_tree]
@@ -61,19 +74,21 @@ are plain Python functions — the library derives each tool's schema and
 description from its signature and docstring, so `tools.py` is the single source
 of truth for what the model knows about them.
 
-Two things shape how it explores, both in `ORCHESTRATOR_PROMPT`
-([`repo_cartographer/agent.py`](repo_cartographer/agent.py)):
+Exactly four tools reach the model, and both halves of that are deliberate:
 
-- **Plan before exploring.** `write_todos` comes from `TodoListMiddleware`, added
-  explicitly — as of deepagents 0.7.3 it is *not* in the default middleware
-  stack, whose built-in suite is the workspace filesystem tools, `execute` and
-  `task`. Mapping a repo is several steps deep, so the prompt asks for a todo
-  list before the first tool call.
-- **The repo is not on disk.** Those built-in workspace tools (`ls`, `read_file`,
-  `grep`) act on the agent's own scratch space, which starts empty — an easy
-  thing for a model to confuse with the repository. The prompt says so outright,
-  because a model that gets this wrong burns its whole step budget on
-  `read_file("src/foo.py") → not found`.
+- **`write_todos` is added.** It comes from `TodoListMiddleware`, passed
+  explicitly — as of deepagents 0.7.3 planning is *not* in the default middleware
+  stack. Mapping a repo is several steps deep, so
+  [`ORCHESTRATOR_PROMPT`](repo_cartographer/agent.py) asks for a todo list before
+  the first tool call, and the agent writes one.
+- **Nine built-ins are taken away.** `create_deep_agent` also supplies a
+  workspace filesystem (`ls`, `read_file`, `grep`, …), a shell, and a sub-agent
+  spawner. They operate on the agent's own scratch space, not the repository — an
+  easy thing for a model to confuse, and an expensive one: the first model tried
+  here burned half its tool calls on `read_file("src/foo.py") → not found`.
+  [`middleware.py`](repo_cartographer/middleware.py) hides them, which roughly
+  halves the requests a run costs. They come back as later phases give them a
+  purpose.
 
 **The tools layer** (`repo_cartographer/tools.py`) is intentionally free of any
 LLM or agent code. It's ordinary, testable Python:
@@ -93,9 +108,11 @@ argument pointed somewhere unreadable), so a caller can tell the two apart.
 
 - **Python 3.12 or newer** — `uv` will install it for you if you don't have it.
 - **[uv](https://docs.astral.sh/uv/)** for dependency management.
-- **An OpenRouter API key** — the default model is
-  `nvidia/nemotron-3-super-120b-a12b:free`, which is free to use. The free tier
-  allows 50 requests/day — see [Notes on the model](#notes-on-the-model).
+- **A model provider key** — either a
+  [Google AI Studio key](https://aistudio.google.com/apikey) (recommended: 500
+  requests/day free, no card) or an [OpenRouter key](https://openrouter.ai/keys)
+  (50/day free). Both are free; see [Notes on the model](#notes-on-the-model) for
+  which to use when.
 - **A GitHub personal access token** — read-only on public repos is enough.
 
 ---
@@ -181,11 +198,16 @@ copy .env.example .env
 `.env` should end up looking like this:
 
 ```ini
-OPENROUTER_API_KEY=sk-or-v1-your-key-here
+GEMINI_API_KEY=AIza-your-key-here
 GITHUB_TOKEN=ghp_your-token-here
 ```
 
-- **OpenRouter key:** https://openrouter.ai/keys
+One model provider is required. Configure both and `LLM_PROVIDER` picks between
+them; configure one and it is used automatically.
+
+- **Google AI Studio key:** https://aistudio.google.com/apikey — no card
+  required, and the higher free request budget of the two.
+- **OpenRouter key (optional):** https://openrouter.ai/keys
 - **GitHub token:** https://github.com/settings/tokens — a fine-grained token
   with read-only access to public repositories is sufficient. Get one even
   though it's technically optional: unauthenticated GitHub allows 60
@@ -256,12 +278,19 @@ from repo_cartographer.agent import agent
 
 result = agent.invoke(
     {"messages": [{"role": "user", "content": "..."}]},
-    config={"recursion_limit": 40},
+    config={"recursion_limit": 60},
 )
 for message in result["messages"]:
     for call in getattr(message, "tool_calls", None) or []:
         print(call["name"])
+
+print(result["messages"][-1].text)   # `.text`, not `.content` — see below
 ```
+
+Read the answer off `.text`, not `.content`. On Gemini, `content` is a list of
+typed blocks (the prose plus an encrypted thought signature), so printing it
+dumps a repr of that structure; on OpenRouter it happens to be a plain string.
+`.text` gives you the prose on both.
 
 Give it a genuinely multi-step question. Asking for one fact wastes the harness —
 the interesting behaviour shows up when the agent has to plan, explore, and
@@ -288,7 +317,8 @@ repo-cartographer/
 ├── repo_cartographer/
 │   ├── __init__.py      Package docstring; re-exports the GitHub tools
 │   ├── agent.py         ORCHESTRATOR_PROMPT, the agent, and ask()
-│   ├── models.py        LLM configuration (OpenRouter) and .env loading
+│   ├── middleware.py    Hides the built-in tools Phase 2 doesn't use
+│   ├── models.py        Provider selection (Google / OpenRouter), .env loading
 │   └── tools.py         GitHub API functions — no LLM code
 ├── tests/
 │   └── test_tools.py    Live tests against the real GitHub API
@@ -304,7 +334,7 @@ backend and no sub-agents yet, the orchestrator prompt and the three tool
 docstrings are the entire specification of the agent's behaviour.
 
 Note that `agent` is deliberately *not* re-exported from `__init__.py`.
-Importing it builds an LLM client and reads `OPENROUTER_API_KEY` immediately, so
+Importing it builds an LLM client and needs a provider key immediately, so
 re-exporting it would make the bare `import repo_cartographer` fail on any
 machine without a configured `.env` — including during test collection. Import
 it from its own module: `from repo_cartographer.agent import agent`.
@@ -336,10 +366,14 @@ PHASE1_MIN_BUDGET=4 uv run pytest
 
 ## Troubleshooting
 
-**`RuntimeError: OPENROUTER_API_KEY is not set`**
-Either `.env` doesn't exist yet (step 4) or the key line is empty. The check is
+**`RuntimeError: No model provider is configured`**
+Either `.env` doesn't exist yet (step 4) or both key lines are empty. The check is
 deliberate — it fails at startup with a clear message rather than surfacing as a
 confusing `401` from deep inside the agent's reasoning loop.
+
+**`400 Function call is missing a thought_signature`**
+You're reaching Gemini through an OpenAI-compatible client. Gemini needs its
+native one — see [Notes on the model](#notes-on-the-model).
 
 **`ModuleNotFoundError: No module named 'repo_cartographer'`**
 You're running a bare `python` instead of `uv run python`, so the project's
@@ -367,43 +401,76 @@ entirely and use `uv run`, which needs no execution-policy change.
 
 ## Notes on the model
 
-The default is `nvidia/nemotron-3-super-120b-a12b:free` — free, and capable
-enough to plan before it explores. Override it from `.env` without touching code:
+Two providers, because on free tiers no single one is good at both jobs this
+project has. Pick with `LLM_PROVIDER`; with only one key configured it is used
+automatically.
 
-```ini
-OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
+| | `google` (default) | `openrouter` |
+|---|---|---|
+| Default model | `gemini-3.5-flash-lite` | `nemotron-3-super-120b-a12b:free` |
+| Requests/day | **500** | 50 |
+| Requests/minute | 15 | 20 |
+| Mapping runs/day | ~50 | ~5 |
+| Best for | iterating on the prompt | runs whose output matters |
+
+**Watch Gemini's per-model daily caps.** They are not uniform, and reaching for a
+bigger model costs you the ability to run at all:
+
+| Model | RPM | TPM | RPD | Runs/day |
+|---|---|---|---|---|
+| `gemini-3.6-flash` | 5 | 250K | **20** | ~2 |
+| `gemini-3.5-flash` | 5 | 250K | **20** | ~2 |
+| **`gemini-3.5-flash-lite`** | 15 | 250K | **500** | **~50** |
+| `gemini-3.1-flash-lite` | 15 | 250K | 500 | ~50 |
+| `gemma-4-31b` | 30 | **16K** | 14,400 | token-bound |
+| `gemini-*-pro` | — | — | 0 | unavailable on free tier |
+
+`gemma-4-31b` is the interesting one: effectively unlimited requests, but 16K
+input tokens/minute, which an agent loop exceeds within a few turns because it
+resends the whole history each time. That becomes usable once **Phase 3's
+filesystem backend** stops file contents from living in every turn — a concrete
+reason to build it.
+
+### Why Gemini needs its native client
+
+Google's OpenAI-compatible endpoint does **not** work for this. Gemini 3 models
+think by default, and every function call they emit carries an encrypted
+`thought_signature` that a stateless client must send back verbatim on the next
+turn. The compatibility layer drops it, so the second turn of any tool-calling
+loop dies with:
+
+```
+400 Function call is missing a thought_signature in functionCall parts.
 ```
 
-[`repo_cartographer/models.py`](repo_cartographer/models.py) lists the free
-tool-calling models worth trying and what each one trades away. One to avoid:
-`openrouter/free` picks a free model at random per request, so no run is
-reproducible — which breaks Phase 2's definition of done and the Phase 5 evals.
+`langchain-google-genai`'s `ChatGoogleGenerativeAI` round-trips it. OpenRouter
+still uses `ChatOpenAI`.
 
 ### Why not the smallest model
 
 The project first ran on `nvidia/nemotron-3-nano-30b-a3b:free` (3B active
-parameters). Measured on a `psf/requests` architecture ask, it:
+parameters). Measured on the same `psf/requests` ask, it:
 
 - **never wrote a plan**, even with `write_todos` available and the prompt asking
-  for one first — which is precisely what Phase 2's definition of done turns on;
+  for one first — precisely what Phase 2's definition of done turns on;
 - spent 8 of 16 tool calls on `read_file`/`ls` against the empty workspace,
   including three identical retries of a path that had already 404'd;
-- still reached a correct, well-cited answer, just wastefully.
+- reached a correct answer, just wastefully.
 
 Multi-step tool use is where small models fall down first, and this task is
-nothing but multi-step tool use.
+nothing but multi-step tool use. Both problems are now fixed from two directions:
+a capable-enough model, and
+[`middleware.py`](repo_cartographer/middleware.py) removing the workspace tools
+so the second failure is not even reachable.
 
-### Free-tier quota is the real constraint
+### If you stay on OpenRouter
 
-OpenRouter's free tier allows **20 requests/minute and 50 requests/day**, across
-all `:free` models combined. One repo-mapping run costs 10–20 requests, so that
-is roughly **three runs a day** — which you will hit while iterating on a prompt.
+Its free tier allows 20 requests/minute and 50/day across all `:free` models
+combined — about three runs. A one-time purchase of **10 credits ($10) raises the
+daily cap to 1,000**, permanently; the credits are not spent by `:free` models,
+so it is a deposit rather than a bill. When the cap is spent you get a `429` with
+`limit_source: openrouter_free_tier_daily` and a reset timestamp (midnight UTC).
 
-A one-time purchase of **10 credits ($10) raises the daily cap to 1,000
-requests**, permanently. The credits are not spent by `:free` models, so this
-stays a zero-marginal-cost setup; it is a deposit, not a bill. The per-minute cap
-is unchanged.
-
-When the daily cap is spent, OpenRouter answers `429` with
-`limit_source: openrouter_free_tier_daily` and an `X-RateLimit-Reset` timestamp
-(midnight UTC).
+Avoid `openrouter/free` — it picks a free model at random per request, so no run
+is reproducible, which breaks both Phase 2's definition of done and Phase 5's
+evals.

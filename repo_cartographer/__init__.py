@@ -10,7 +10,7 @@ package root: `from repo_cartographer import get_repo_tree`. They stand alone,
 with no LLM involved.
 
 `agent` is deliberately not re-exported. Importing it builds a chat model and
-reads OPENROUTER_API_KEY at import time, so re-exporting it would make the bare
+needs a provider key at import time, so re-exporting it would make the bare
 statement `import repo_cartographer` fail whenever no .env is configured —
 including during test collection. Import it from its own module instead:
 `from repo_cartographer.agent import agent`.
