@@ -1,4 +1,11 @@
-# The following functions are designed to interact with GitHub repositories using the GitHub API. They allow you to retrieve the repository tree, get the contents of a specific file, and search for code within a repository.
+"""Repo Cartographer's GitHub layer: list a repo's files, read one, search them.
+
+The whole of the agent's access to a repository, and deliberately free of any
+LLM or agent code — three ordinary functions over the GitHub REST API, testable
+on their own. Every failure mode raises `GitHubError` (the API said no) or
+`ValueError` (the argument pointed somewhere unreadable), so a caller can tell
+an API problem from a bad path.
+"""
 
 import base64
 import os
@@ -79,8 +86,6 @@ def get_repo_tree(owner: str, repo: str, ref: str = "HEAD") -> list[str]:
 
     return [item['path'] for item in tree_data.get('tree', []) if item.get('type') == 'blob']
 
-# The following function retrieves the contents of a specific file in a GitHub repository. It uses the GitHub API to fetch the file's content, which is returned in base64 encoding. The function decodes this content and returns it as a string.
-
 def get_file_contents(owner: str, repo: str, path: str) -> str: 
     """
     Get the contents of a file in a GitHub repository.
@@ -155,8 +160,6 @@ def get_file_contents(owner: str, repo: str, path: str) -> str:
             f"'{path}' in {owner}/{repo} is not UTF-8 text — likely a binary "
             f"file such as an image or archive ({exc})"
         ) from exc
-
-# The following function allows you to search for code within a specific GitHub repository. It constructs a search query using the provided owner, repository name, and search term, and then makes a request to the GitHub API to retrieve the search results. The results are returned as a list of dictionaries, each representing a search result.
 
 def search_code(owner: str, repo: str, query: str) -> list[dict]:
     """

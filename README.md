@@ -25,9 +25,18 @@ reasoning behind the ordering.
 | 2 | Bare agent (tools + prompt) | Done — this is what runs today |
 | 3+ | Filesystem backend, sub-agents, evals, skills | Planned |
 
-What works right now: a single agent with three GitHub tools that can answer
-multi-step questions about a repository. The "write a full onboarding guide"
-product described in the implementation guide is still ahead.
+What works right now: a single agent with three GitHub tools and a planning tool,
+which can answer multi-step questions about a repository. The "write a full
+onboarding guide" product described in the implementation guide is still ahead,
+and so is everything Phase 3 onward — there is no filesystem backend, no
+sub-agent, no eval set, and no citation checking yet. Paths in the answer come
+with the prompt's instruction to cite only verified ones, not with a guarantee.
+
+One caveat on Phase 2's definition of done ("it calls the planning tool before
+any of yours, unprompted"): the planning tool is wired up and the prompt asks for
+a plan first, but whether the model complies depends on which model you run. The
+3B-active model this started on never did. See
+[Notes on the model](#notes-on-the-model).
 
 ---
 
@@ -37,7 +46,8 @@ product described in the implementation guide is still ahead.
 flowchart LR
     U([Your question]) --> A[Agent<br/>deepagents + LangGraph]
     A <--> M[["LLM<br/>via OpenRouter"]]
-    A --> T{Tools}
+    A --> P[write_todos<br/>plan the exploration]
+    A --> T{GitHub tools}
     T --> T1[get_repo_tree]
     T --> T2[get_file_contents]
     T --> T3[search_code]
@@ -46,10 +56,24 @@ flowchart LR
 ```
 
 The agent loops: the model picks a tool, the tool calls GitHub, the result goes
-back into the model's context, repeat until it can answer. The three tools are
-plain Python functions — the library derives each tool's schema and description
-from its signature and docstring, so `tools.py` is the single source of truth for
-what the model knows about them.
+back into the model's context, repeat until it can answer. The three GitHub tools
+are plain Python functions — the library derives each tool's schema and
+description from its signature and docstring, so `tools.py` is the single source
+of truth for what the model knows about them.
+
+Two things shape how it explores, both in `ORCHESTRATOR_PROMPT`
+([`repo_cartographer/agent.py`](repo_cartographer/agent.py)):
+
+- **Plan before exploring.** `write_todos` comes from `TodoListMiddleware`, added
+  explicitly — as of deepagents 0.7.3 it is *not* in the default middleware
+  stack, whose built-in suite is the workspace filesystem tools, `execute` and
+  `task`. Mapping a repo is several steps deep, so the prompt asks for a todo
+  list before the first tool call.
+- **The repo is not on disk.** Those built-in workspace tools (`ls`, `read_file`,
+  `grep`) act on the agent's own scratch space, which starts empty — an easy
+  thing for a model to confuse with the repository. The prompt says so outright,
+  because a model that gets this wrong burns its whole step budget on
+  `read_file("src/foo.py") → not found`.
 
 **The tools layer** (`repo_cartographer/tools.py`) is intentionally free of any
 LLM or agent code. It's ordinary, testable Python:
@@ -70,7 +94,8 @@ argument pointed somewhere unreadable), so a caller can tell the two apart.
 - **Python 3.12 or newer** — `uv` will install it for you if you don't have it.
 - **[uv](https://docs.astral.sh/uv/)** for dependency management.
 - **An OpenRouter API key** — the default model is
-  `nvidia/nemotron-3-nano-30b-a3b:free`, which is free to use.
+  `nvidia/nemotron-3-super-120b-a12b:free`, which is free to use. The free tier
+  allows 50 requests/day — see [Notes on the model](#notes-on-the-model).
 - **A GitHub personal access token** — read-only on public repos is enough.
 
 ---
@@ -183,6 +208,14 @@ mocking, so a pass means your token works and the tools genuinely function.
 
 ## Running it
 
+Ask your own question:
+
+```bash
+uv run main.py "Explore pallets/flask and explain how routing works."
+```
+
+Or run the built-in example ask, which maps `pallets/flask`:
+
 ```bash
 uv run python -m repo_cartographer.agent
 ```
@@ -206,21 +239,28 @@ If PowerShell blocks the script, allow it for your user once with
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Leave with `deactivate`.
 </details>
 
-### Asking your own question
+### Driving it from Python
 
-`repo_cartographer/agent.py` ends with a runnable example. Edit the question
-there, or import the agent and drive it yourself:
+```python
+from repo_cartographer.agent import ask
+
+print(ask("Explore pallets/flask and explain its architecture."))
+```
+
+`ask()` is a thin wrapper. For the full message history — every tool call, in
+order, which is what you want when you're studying the agent's behaviour rather
+than its answer — invoke the graph directly:
 
 ```python
 from repo_cartographer.agent import agent
 
-result = agent.invoke({
-    "messages": [{
-        "role": "user",
-        "content": "Explore the flask repo (pallets/flask) and explain its architecture.",
-    }]
-})
-print(result["messages"][-1].content)
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "..."}]},
+    config={"recursion_limit": 40},
+)
+for message in result["messages"]:
+    for call in getattr(message, "tool_calls", None) or []:
+        print(call["name"])
 ```
 
 Give it a genuinely multi-step question. Asking for one fact wastes the harness —
@@ -246,17 +286,22 @@ print(get_file_contents("pallets", "flask", "pyproject.toml"))
 ```
 repo-cartographer/
 ├── repo_cartographer/
-│   ├── __init__.py      Package marker; re-exports the GitHub tools
-│   ├── agent.py         Agent definition + runnable example
+│   ├── __init__.py      Package docstring; re-exports the GitHub tools
+│   ├── agent.py         ORCHESTRATOR_PROMPT, the agent, and ask()
 │   ├── models.py        LLM configuration (OpenRouter) and .env loading
 │   └── tools.py         GitHub API functions — no LLM code
 ├── tests/
 │   └── test_tools.py    Live tests against the real GitHub API
+├── main.py              CLI: uv run main.py "your question"
 ├── .env.example         Template for your keys — copy to .env
 ├── IMPLEMENTATION_GUIDE.md   The phased build plan
 ├── pyproject.toml       Dependencies and tool config
 └── uv.lock              Exact pinned versions
 ```
+
+`agent.py` holds the prompt because the prompt *is* Phase 2: with no filesystem
+backend and no sub-agents yet, the orchestrator prompt and the three tool
+docstrings are the entire specification of the agent's behaviour.
 
 Note that `agent` is deliberately *not* re-exported from `__init__.py`.
 Importing it builds an LLM client and reads `OPENROUTER_API_KEY` immediately, so
@@ -305,10 +350,14 @@ run it from the repository root.
 Your `GITHUB_TOKEN` is missing, expired, or the hourly quota is spent. Limits
 reset hourly; `PHASE1_MIN_BUDGET=4 uv run pytest` runs a reduced set meanwhile.
 
+**`429 Rate limit exceeded: free-models-per-day` from OpenRouter**
+The free tier's 50 requests/day is spent; it resets at midnight UTC. Ten credits
+($10, one time) raise the cap to 1,000/day — see
+[Notes on the model](#notes-on-the-model).
+
 **`401` or `402` from OpenRouter**
-The key is wrong, or the free model is temporarily rate-limited. Free models are
-shared and can be busy — change the model name in
-[`repo_cartographer/models.py`](repo_cartographer/models.py) to try another.
+The key is wrong, or the free endpoint is busy — free models are shared. Set
+`OPENROUTER_MODEL` in `.env` to try another.
 
 **PowerShell won't run the activate script**
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, once. Or skip activation
@@ -318,8 +367,43 @@ entirely and use `uv run`, which needs no execution-policy change.
 
 ## Notes on the model
 
-The default is a free model on OpenRouter, chosen so the project can be cloned
-and run at no cost. Free models are less capable at multi-step tool use than
-frontier ones, so if the agent seems to give up early or skips exploring, swap
-the model in `repo_cartographer/models.py` — anything OpenRouter serves works,
-since the configuration is a standard OpenAI-compatible client.
+The default is `nvidia/nemotron-3-super-120b-a12b:free` — free, and capable
+enough to plan before it explores. Override it from `.env` without touching code:
+
+```ini
+OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
+```
+
+[`repo_cartographer/models.py`](repo_cartographer/models.py) lists the free
+tool-calling models worth trying and what each one trades away. One to avoid:
+`openrouter/free` picks a free model at random per request, so no run is
+reproducible — which breaks Phase 2's definition of done and the Phase 5 evals.
+
+### Why not the smallest model
+
+The project first ran on `nvidia/nemotron-3-nano-30b-a3b:free` (3B active
+parameters). Measured on a `psf/requests` architecture ask, it:
+
+- **never wrote a plan**, even with `write_todos` available and the prompt asking
+  for one first — which is precisely what Phase 2's definition of done turns on;
+- spent 8 of 16 tool calls on `read_file`/`ls` against the empty workspace,
+  including three identical retries of a path that had already 404'd;
+- still reached a correct, well-cited answer, just wastefully.
+
+Multi-step tool use is where small models fall down first, and this task is
+nothing but multi-step tool use.
+
+### Free-tier quota is the real constraint
+
+OpenRouter's free tier allows **20 requests/minute and 50 requests/day**, across
+all `:free` models combined. One repo-mapping run costs 10–20 requests, so that
+is roughly **three runs a day** — which you will hit while iterating on a prompt.
+
+A one-time purchase of **10 credits ($10) raises the daily cap to 1,000
+requests**, permanently. The credits are not spent by `:free` models, so this
+stays a zero-marginal-cost setup; it is a deposit, not a bill. The per-minute cap
+is unchanged.
+
+When the daily cap is spent, OpenRouter answers `429` with
+`limit_source: openrouter_free_tier_daily` and an `X-RateLimit-Reset` timestamp
+(midnight UTC).
