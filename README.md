@@ -111,7 +111,7 @@ there. Eight tools reach the model, and both halves of that are deliberate:
 - **`write_todos` is added.** It comes from `TodoListMiddleware`, passed
   explicitly — as of deepagents 0.7.3 planning is *not* in the default middleware
   stack. Mapping a repo is several steps deep, so
-  [`ORCHESTRATOR_PROMPT`](repo_cartographer/agent.py) asks for a todo list before
+  [`ORCHESTRATOR_PROMPT`](repo_cartographer/prompts.py) asks for a todo list before
   the first tool call, and the agent writes one.
 - **Five built-ins are taken away.** `create_deep_agent` also supplies `glob`,
   `grep`, `delete`, a shell (`execute`) and a sub-agent spawner (`task`). Search
@@ -367,7 +367,8 @@ print(get_file_contents("pallets", "flask", "pyproject.toml"))
 repo-cartographer/
 ├── repo_cartographer/
 │   ├── __init__.py      Package docstring; re-exports the GitHub tools
-│   ├── agent.py         ORCHESTRATOR_PROMPT, build_agent(), ask()
+│   ├── agent.py         build_agent(), map_repo(), ask() — the wiring
+│   ├── prompts.py       The instructions the agent works from
 │   ├── middleware.py    Hides the built-in tools this phase doesn't use
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
 │   └── tools.py         GitHub API functions — no LLM code
@@ -533,7 +534,7 @@ hiding the workspace tools outright; Phase 3 gives them back, so what now keeps
 the model from repeating that mistake is the prompt drawing the line between a
 remote read-only repository and a local workspace that starts empty — a weaker
 guarantee than removal, and the reason the distinction is stated twice in
-[`ORCHESTRATOR_PROMPT`](repo_cartographer/agent.py).
+[`ORCHESTRATOR_PROMPT`](repo_cartographer/prompts.py).
 
 ### If you stay on OpenRouter
 
