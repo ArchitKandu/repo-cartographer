@@ -1,28 +1,52 @@
-"""Repo Cartographer's agent — Phase 3: the bare agent plus somewhere to put things.
+"""Repo Cartographer's agent — Phase 4: one orchestrator, two sub-agents.
 
-Phase 2 was tools and a prompt. Phase 3 adds one variable and no more: a
-workspace on disk the agent can write to, so what it learns about a repository
-stops living exclusively in a message thread that is re-sent on every turn.
-Still no sub-agents (Phase 4) and no skills (Phase 7). Everything the agent
-knows about a repository, it learns at run time through `tools.py`.
+Phase 3 was one agent with a workspace. Phase 4 changes one thing: the work is
+split three ways. An `explorer` holds the GitHub tools and reads code; a
+`doc-writer` holds no repository access at all and writes the guide from the
+explorer's notes; the orchestrator holds neither and only delegates. No skills
+yet (Phase 7). Everything the system knows about a repository it learns at run
+time through `tools.py`.
 
-What lives here is the wiring — model, tools, middleware, and the order they go
-in. The instructions the agent works from are in `prompts.py`, and the model it
-reasons with is in `models.py`, so neither is a reason to edit this file.
+The mechanism the phase is about is context quarantine. Each sub-agent runs in
+its own message thread, so a file the explorer reads never enters the
+orchestrator's context — only the explorer's short final report does. That is a
+stronger version of what Phase 3's eviction bought: eviction takes a large tool
+result out of the thread *after* paying for it once, while a sub-agent keeps it
+out of the parent thread entirely.
+
+Quarantine is not free, and the cost is worth naming: the parent can no longer
+see what its children read. Everything that has to cross the boundary crosses it
+through exactly two channels — a sub-agent's final message, and files in the
+shared workspace — which is why the handoff conventions in `prompts.py` are
+stated from all three sides.
+
+What lives here is the wiring — models, tools, middleware, and the order they go
+in. The instructions each agent works from are in `prompts.py`, and the model
+they reason with is in `models.py`, so neither is a reason to edit this file.
 """
 
 from pathlib import Path
 from typing import Any
 
-from deepagents import create_deep_agent
+from deepagents import SubAgent, create_deep_agent
 from deepagents.backends import FilesystemBackend
+from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware import FilesystemMiddleware
+from deepagents.profiles import (
+    GeneralPurposeSubagentProfile,
+    HarnessProfileConfig,
+    register_harness_profile,
+)
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langgraph.graph.state import CompiledStateGraph
 
 from repo_cartographer.middleware import RestrictToolsMiddleware
-from repo_cartographer.models import model
-from repo_cartographer.prompts import ORCHESTRATOR_PROMPT
+from repo_cartographer.models import MODEL_PROFILE_KEY, model
+from repo_cartographer.prompts import (
+    DOC_WRITER_PROMPT,
+    EXPLORER_PROMPT,
+    ORCHESTRATOR_PROMPT,
+)
 from repo_cartographer.tools import get_file_contents, get_repo_tree, search_code
 
 # Anchored to this file, not the working directory, for the same reason models.py
@@ -40,6 +64,117 @@ WORKSPACE.mkdir(exist_ok=True)
 # source file — large enough that the agent's own notes and small files stay
 # inline, small enough that the big reads offload.
 TOOL_RESULT_TOKEN_LIMIT = 2_000
+
+# `create_deep_agent` adds a `general-purpose` sub-agent to the `task` tool's menu
+# unless told otherwise, described to the model as having "all tools as the main
+# agent" — which, now that the orchestrator holds no tools at all, means none. It
+# is a delegate that can do nothing, advertised as the one that can do anything,
+# and Phase 2 already measured what an unusable tool costs: 8 of 16 calls spent on
+# a workspace that had nothing in it. So it is switched off, and the `task` menu
+# lists exactly the two agents this project defines.
+#
+# A harness profile is the library's own mechanism for this. Registration is keyed
+# by model, and the key comes from models.py because its shape differs per
+# provider. Two things to know if it ever stops working: a key that fails to match
+# does not raise, it silently leaves the default sub-agent in place — so
+# `tests/test_wiring.py` asserts the menu, rather than trusting this call — and
+# `deepagents.profiles` is a documented beta API, so an upgrade could move it.
+register_harness_profile(
+    MODEL_PROFILE_KEY,
+    HarnessProfileConfig(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+    ),
+)
+
+
+def build_subagents(
+    backend: BackendProtocol, *, tool_result_token_limit: int | None
+) -> list[SubAgent]:
+    """The two delegates, as specs rather than compiled graphs.
+
+    Kept as a separate function, returning plain dicts, so the split can be
+    checked without building an agent or spending a request: `tests/test_wiring.py`
+    asserts against what this returns. That is the whole reason it is not inlined
+    into `build_agent`.
+
+    Two things here are easy to get wrong and silent when you do:
+
+    `tools` must be given explicitly, including the empty list. A spec that omits
+    the key inherits the parent's tools — which used to be the GitHub three and is
+    now nothing at all, so *both* mistakes are available depending on the phase.
+    `doc_writer`'s `"tools": []` is what makes its lack of repository access a
+    property of the graph instead of a promise in a prompt.
+
+    Each spec restates `FilesystemMiddleware`, because a parent's middleware is
+    not inherited by declarative sub-agents. Without it, both delegates get the
+    full built-in suite — `execute`, `glob`, `grep`, `delete` — every tool
+    `RestrictToolsMiddleware` is careful to keep away from the orchestrator, handed
+    straight back to the agents doing the actual work. Naming `tools=` here is
+    also stronger than hiding them: excluded tools are never constructed, so they
+    cannot be dispatched even by a malformed tool call.
+    """
+    # Annotated, and pulled out of the dicts below, for the reason `build_agent`'s
+    # middleware list is annotated: a bare list of one FilesystemMiddleware infers
+    # to a type narrower than `SubAgent["middleware"]` accepts, and mypy rejects an
+    # entry that is correct at run time.
+    explorer_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        FilesystemMiddleware(
+            backend=backend,
+            # `read_file` for a tree another explorer already fetched, `write_file`
+            # for its own notes. It has no reason to list a directory, or to edit a
+            # file it wrote seconds earlier in a single call.
+            tools=["read_file", "write_file"],
+            # Restated, or Phase 3's mechanism quietly dies here. Sub-agents get a
+            # fresh FilesystemMiddleware at the library default of 20_000 tokens —
+            # and after this refactor the explorer is the only agent making large
+            # reads, so the tuned threshold would be installed on the two agents
+            # that no longer need it and absent from the one that does.
+            tool_token_limit_before_evict=tool_result_token_limit,
+        ),
+    ]
+    doc_writer_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        FilesystemMiddleware(
+            backend=backend,
+            # Read-only, and `ls` on purpose: the orchestrator's brief lists the
+            # notes paths, but a brief is a claim. Listing the directory is how the
+            # doc-writer learns an explorer died half way, instead of writing a
+            # guide around a file that is not there.
+            tools=["ls", "read_file"],
+        ),
+    ]
+
+    return [
+        {
+            "name": "explorer",
+            # The orchestrator picks a delegate from this line and nothing else, so
+            # it says what the agent needs handed to it, not just what it does.
+            "description": (
+                "Reads one scope of a public GitHub repository — a top-level "
+                "directory, or the whole repo when it is small — and writes what it "
+                "finds to a notes file in the workspace. Has the GitHub tools. "
+                "Brief it with the owner, the repo, the scope, the question in "
+                "full, and the exact workspace path to write its notes to."
+            ),
+            "system_prompt": EXPLORER_PROMPT,
+            "tools": [get_repo_tree, get_file_contents, search_code],
+            "middleware": explorer_middleware,
+        },
+        {
+            "name": "doc-writer",
+            "description": (
+                "Writes the onboarding guide from notes already in the workspace, "
+                "and returns it as its final message. Has no repository access, so "
+                "anything it should mention must already be in the notes. Brief it "
+                "with the question and the exact notes paths."
+            ),
+            "system_prompt": DOC_WRITER_PROMPT,
+            # Not an oversight, and not inheritance — the guarantee the whole
+            # design rests on. An agent that cannot reach GitHub cannot cite a file
+            # nobody read.
+            "tools": [],
+            "middleware": doc_writer_middleware,
+        },
+    ]
 
 
 def build_agent(
@@ -67,7 +202,12 @@ def build_agent(
         # The planning tool (`write_todos`) is not part of deepagents' default
         # middleware stack as of 0.7.3 — the built-in suite is the filesystem
         # tools, `execute` and `task`. Watching the agent plan before it explores
-        # is Phase 2's whole point, so planning is added explicitly.
+        # is Phase 2's whole point, so planning is added explicitly. Note it lands
+        # on the orchestrator alone: the sub-agent stack is filesystem,
+        # summarization and tool-call patching, with no planning middleware, so
+        # neither delegate can write todos. That is the right division — a delegate
+        # is handed a plan, it does not make one — and it is why EXPLORER_PROMPT
+        # has no planning step.
         TodoListMiddleware(),
         # Replaces, rather than adds to, the FilesystemMiddleware
         # `create_deep_agent` installs by default: custom middleware is merged
@@ -76,11 +216,17 @@ def build_agent(
         # everything else here is the default.
         FilesystemMiddleware(
             backend=backend,
+            # Still worth setting, though the orchestrator no longer reads files:
+            # what flows into this thread now is sub-agent reports, and an explorer
+            # that returns something enormous gets offloaded the same way a large
+            # file used to be.
             tool_token_limit_before_evict=tool_result_token_limit,
         ),
         # ...and the built-ins this phase has no use for are taken away again.
         # Last in the list so it runs after everything that injects tools. See
-        # middleware.py for why this is worth the four extra lines.
+        # middleware.py for why this is worth the four extra lines — and note it
+        # applies to the orchestrator only, which is why each sub-agent narrows its
+        # own tools in `build_subagents`.
         RestrictToolsMiddleware(),
     ]
 
@@ -88,15 +234,23 @@ def build_agent(
         name="repo_cartographer",
         system_prompt=ORCHESTRATOR_PROMPT,
         model=model,
-        # Passed as plain functions: LangChain derives each tool's schema and
-        # description from its signature and docstring, so tools.py stays the
-        # single source of truth for what the model knows about them.
-        tools=[get_repo_tree, get_file_contents, search_code],
-        # Files land in ./workspace instead of graph state. Note that this is not
-        # what reduces context — a StateBackend keeps files out of the message
-        # thread just as well. What disk buys is that the notes outlive the run
-        # and can be read afterwards, which is the difference between claiming
-        # the agent offloaded and showing the file it wrote.
+        # Empty, and this is the phase's real edit. Leave the GitHub tools here and
+        # the orchestrator keeps using them: delegating costs it a turn and a leap
+        # of faith, and a model takes the shorter path. You would end up with a
+        # `task` tool it never calls, a trace identical to Phase 3, and the
+        # conclusion that sub-agents did not help. Removing the tools makes
+        # delegation the only route to the data, which is what makes the trace mean
+        # something.
+        tools=[],
+        # Passed as plain functions inside the specs: LangChain derives each tool's
+        # schema and description from its signature and docstring, so tools.py stays
+        # the single source of truth for what the model knows about them.
+        subagents=build_subagents(backend, tool_result_token_limit=tool_result_token_limit),
+        # One backend for all three agents, which is what makes the workspace a
+        # channel between them rather than three private scratch spaces: the
+        # explorer writes /notes/overview.md and the doc-writer reads that same
+        # file. Sub-agents inherit this instance from here — it is not something
+        # their specs set.
         backend=backend,
         middleware=middleware,
     )

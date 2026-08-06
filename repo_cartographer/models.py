@@ -70,12 +70,15 @@ _NO_KEYS = (
 )
 
 
-def _build_model() -> BaseChatModel:
-    """Construct the chat model named by LLM_PROVIDER, or by whichever key exists.
+def _build_model() -> tuple[BaseChatModel, str]:
+    """Construct the chat model named by LLM_PROVIDER, and the key it resolves under.
 
     Keys are checked here rather than left to the first request: without one both
     providers answer 401, which surfaces deep inside the agent loop as an opaque
     failure rather than a missing-configuration message.
+
+    The second return value is a deepagents harness-profile key — see
+    `MODEL_PROFILE_KEY` below for what it is for and why it is computed here.
     """
     google_key = os.environ.get("GEMINI_API_KEY")
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
@@ -95,9 +98,13 @@ def _build_model() -> BaseChatModel:
                 "LLM_PROVIDER=google but GEMINI_API_KEY is not set. Get a key at "
                 "https://aistudio.google.com/apikey, or set LLM_PROVIDER=openrouter."
             )
-        return ChatGoogleGenerativeAI(
-            model=os.environ.get("GOOGLE_MODEL", _DEFAULT_GOOGLE_MODEL),
-            api_key=SecretStr(google_key),
+        google_model = os.environ.get("GOOGLE_MODEL", _DEFAULT_GOOGLE_MODEL)
+        return (
+            ChatGoogleGenerativeAI(model=google_model, api_key=SecretStr(google_key)),
+            # `google_genai` is the provider name langchain reports for this class,
+            # and Gemini model names contain no colon, so the joined form is what
+            # deepagents looks up first.
+            f"google_genai:{google_model}",
         )
 
     if provider == "openrouter":
@@ -106,10 +113,19 @@ def _build_model() -> BaseChatModel:
                 "LLM_PROVIDER=openrouter but OPENROUTER_API_KEY is not set. Get a "
                 "key at https://openrouter.ai/keys, or set LLM_PROVIDER=google."
             )
-        return ChatOpenAI(
-            model=os.environ.get("OPENROUTER_MODEL", _DEFAULT_OPENROUTER_MODEL),
-            base_url=_OPENROUTER_BASE_URL,
-            api_key=SecretStr(openrouter_key),
+        openrouter_model = os.environ.get("OPENROUTER_MODEL", _DEFAULT_OPENROUTER_MODEL)
+        return (
+            ChatOpenAI(
+                model=openrouter_model,
+                base_url=_OPENROUTER_BASE_URL,
+                api_key=SecretStr(openrouter_key),
+            ),
+            # Not `openai:<model>`. OpenRouter model names carry their own colon
+            # (`vendor/model:free`), and deepagents refuses any key with more than
+            # one — so the joined form would silently fall through to the
+            # provider-wide `openai` registration, which is far too broad. The bare
+            # identifier splits cleanly and matches on its own.
+            openrouter_model,
         )
 
     raise RuntimeError(
@@ -117,4 +133,13 @@ def _build_model() -> BaseChatModel:
     )
 
 
-model = _build_model()
+model, MODEL_PROFILE_KEY = _build_model()
+"""The key `model` resolves under in deepagents' harness-profile registry.
+
+Published from here because this module is the only place that knows which of the
+two providers was actually built, and the key's *shape* differs between them —
+see the comments in `_build_model`. `agent.py` uses it to switch off a default
+sub-agent it has no use for; a key that fails to match doesn't raise, it just
+silently leaves the default in place, which is why the shape is worth a comment
+rather than a guess.
+"""

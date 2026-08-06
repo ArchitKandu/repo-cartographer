@@ -9,9 +9,12 @@ mapping run at Phase 2, when the workspace was empty and unused, the model spent
 retries of a path that had already 404'd. Removing them halved the requests a
 run cost, which matters when the free-tier budget is counted in requests per day.
 
-Phase 3 gives the workspace an actual purpose, so the file tools come back and
-the exclusion list shrinks to what is still unused. That is the intended shape:
-a set that gets smaller as each phase finds a use for another built-in.
+Phase 3 gave the workspace an actual purpose, so the file tools came back and the
+exclusion list shrank to what was still unused. Phase 4 shows the set is not
+monotonic: `task` leaves it, because sub-agents are the whole point of the phase,
+while `write_file` and `edit_file` join it, because the orchestrator stopped
+writing — its explorers write and its doc-writer reads, and it only looks. The
+set tracks *this* agent's responsibilities, and those move.
 
 deepagents has its own version of this, reached through
 `HarnessProfile(excluded_tools=...)`. It does not fire here: profiles resolve
@@ -37,25 +40,31 @@ if TYPE_CHECKING:
     )
     from langchain_core.messages import AIMessage
 
-# The deepagents built-ins that Phase 3 has no use for. `ls`, `read_file`,
-# `write_file` and `edit_file` are absent from this set because Phase 3 is the
-# phase that gives them something to do; `task` leaves it when Phase 4 introduces
-# sub-agents. Each phase should remove what it has found a use for and nothing
-# else — the set shrinking one entry at a time is the record of that.
+# The deepagents built-ins the *orchestrator* has no use for as of Phase 4. Note
+# the scope: this middleware runs on the main agent only, so nothing here is
+# hidden from the explorer or the doc-writer. Their tool sets are narrowed a
+# different way — `FilesystemMiddleware(tools=[...])` inside each spec — because
+# a parent's middleware is not inherited by declarative sub-agents.
 UNUSED_BUILTIN_TOOLS = frozenset(
     {
-        # Search over a workspace holding a single notes file the agent wrote
-        # itself. There is nothing here it does not already know.
+        # Search over a workspace holding notes the job's own agents wrote, at
+        # paths the orchestrator chose. There is nothing here it cannot already
+        # find with `ls`.
         "glob",
         "grep",
-        # Notes accumulate over a run and are read once at the end; nothing needs
-        # removing, and an agent that can delete its own findings can lose them.
+        # Notes are the durable record of a run, and the one agent that could
+        # delete them has no reason to.
         "delete",
         # No sandbox backend, so this returns an error string rather than running
         # anything. Offering a tool that cannot work only invites a wasted turn.
         "execute",
-        # Phase 4's variable, kept out so Phase 3 measures one thing.
-        "task",
+        # Phase 4 moved writing out of the orchestrator: the explorer writes its
+        # notes, the doc-writer returns prose, and this agent only checks that the
+        # notes arrived. A write tool it never needs is a write tool it can waste
+        # a turn on — and an orchestrator that can edit its delegates' findings
+        # can quietly launder them, which defeats the point of delegating.
+        "write_file",
+        "edit_file",
     }
 )
 
