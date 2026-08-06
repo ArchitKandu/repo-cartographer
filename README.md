@@ -22,8 +22,9 @@ reasoning behind the ordering.
 |---|---|---|
 | 0 | Environment, packaging, config | Done |
 | 1 | GitHub tools layer + tests | Done — 21 tests, no mocking |
-| 2 | Bare agent (tools + prompt) | Done — this is what runs today |
-| 3+ | Filesystem backend, sub-agents, evals, skills | Planned |
+| 2 | Bare agent (tools + prompt) | Done |
+| 3 | Filesystem backend | Done — this is what runs today |
+| 4+ | Sub-agents, evals, skills | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
 tool before calling any of yours, unprompted"* — is met. On `psf/requests` with
@@ -44,12 +45,36 @@ tool before calling any of yours, unprompted"* — is met. On `psf/requests` wit
 Nine tool calls, no wasted ones. The answer correctly located wire-level sending
 in `adapters.py` (`HTTPAdapter.send`) and session state in `sessions.py`.
 
-What works right now: a single agent with three GitHub tools and a planning tool,
-answering multi-step questions about a repository. The "write a full onboarding
-guide" product is still ahead, and so is everything Phase 3 onward — no
-filesystem backend, no sub-agent, no eval set, no citation checking. Paths in the
-answer carry the prompt's instruction to cite only verified ones, not a
-guarantee; that guarantee is Phase 6's job.
+Phase 3's definition of done is a number: run the same task with and without
+offloading and watch the message history shrink. `uv run
+scripts/measure_context.py` runs both arms and prints the comparison. On
+`psf/requests` with `gemini-3.5-flash-lite`:
+
+```
+                             offload off            offload on
+cumulative input tokens          241,196               211,386
+final-turn input tokens           37,786                21,443
+results evicted                        0                     2
+```
+
+The final-turn figure is the one to read: by the end of the run the thread had
+grown to 37.8k tokens without offloading and 21.4k with it, because two file
+reads had been written to `workspace/` and replaced in the thread by a preview.
+Cumulative input — what the run actually cost, since the thread is re-sent every
+turn — fell 12%.
+
+Both numbers are a single run per arm, and the arms are not deterministic: the
+model chooses which files to open. `--repeats N` reports the spread instead, and
+the script says so itself when the ranges overlap. It also refuses to take credit
+it hasn't earned — when nothing crossed the eviction threshold it prints that
+fact rather than the difference, which is exactly what happened on the first repo
+tried, whose only large file was a lockfile the prompt tells the agent to skip.
+
+What works right now: a single agent with three GitHub tools, a planning tool, and
+a workspace it writes findings into. The "write a full onboarding guide" product
+is still ahead, and so is everything Phase 4 onward — no sub-agent, no eval set,
+no citation checking. Paths in the answer carry the prompt's instruction to cite
+only verified ones, not a guarantee; that guarantee is Phase 6's job.
 
 ---
 
@@ -65,6 +90,10 @@ flowchart LR
     T --> T2[get_file_contents]
     T --> T3[search_code]
     T1 & T2 & T3 --> G[(GitHub REST API)]
+    A --> W{Workspace tools}
+    W --> W1[write_file / edit_file]
+    W --> W2[read_file / ls]
+    W1 & W2 --> D[("./workspace<br/>notes.md")]
     A --> R([Answer])
 ```
 
@@ -74,21 +103,43 @@ are plain Python functions — the library derives each tool's schema and
 description from its signature and docstring, so `tools.py` is the single source
 of truth for what the model knows about them.
 
-Exactly four tools reach the model, and both halves of that are deliberate:
+There are two namespaces here and keeping them apart is most of the prompt's job.
+GitHub is remote and read-only; the workspace is local, writable, and starts
+empty, so `read_file` reaches a repository file only after the agent has put one
+there. Eight tools reach the model, and both halves of that are deliberate:
 
 - **`write_todos` is added.** It comes from `TodoListMiddleware`, passed
   explicitly — as of deepagents 0.7.3 planning is *not* in the default middleware
   stack. Mapping a repo is several steps deep, so
   [`ORCHESTRATOR_PROMPT`](repo_cartographer/agent.py) asks for a todo list before
   the first tool call, and the agent writes one.
-- **Nine built-ins are taken away.** `create_deep_agent` also supplies a
-  workspace filesystem (`ls`, `read_file`, `grep`, …), a shell, and a sub-agent
-  spawner. They operate on the agent's own scratch space, not the repository — an
-  easy thing for a model to confuse, and an expensive one: the first model tried
-  here burned half its tool calls on `read_file("src/foo.py") → not found`.
-  [`middleware.py`](repo_cartographer/middleware.py) hides them, which roughly
-  halves the requests a run costs. They come back as later phases give them a
-  purpose.
+- **Five built-ins are taken away.** `create_deep_agent` also supplies `glob`,
+  `grep`, `delete`, a shell (`execute`) and a sub-agent spawner (`task`). Search
+  over a workspace holding one file the agent wrote itself tells it nothing;
+  `execute` has no sandbox backend to run in and only returns an error; `task` is
+  Phase 4's variable, kept out so Phase 3 measures one thing.
+  [`middleware.py`](repo_cartographer/middleware.py) hides them. This mattered
+  more at Phase 2, when the whole filesystem was hidden: the first model tried
+  here spent 8 of 16 tool calls on `read_file("src/foo.py") → not found` before
+  the workspace had any purpose, and removing the tools halved what a run cost.
+  The set shrinks by one entry per phase, as each phase finds a use for another
+  built-in.
+
+**Offloading.** `FilesystemMiddleware` watches every tool result and writes any
+one over `TOOL_RESULT_TOKEN_LIMIT` (2,000 tokens, well below the library's 20,000
+default) into the workspace, leaving a head-and-tail preview and a path in the
+thread. This is what keeps a 10,000-token file from being re-sent on every
+subsequent turn, and it applies to the GitHub tools too — the exclusion list in
+the library covers only its own built-ins. On top of that the prompt asks the
+agent to keep `/notes.md` as it reads and to answer from the notes rather than
+from the sources, so what survives to the final turn is the summary and not the
+files.
+
+Worth being precise about what the *backend* buys, since it's easy to overclaim:
+files land in `./workspace` rather than in graph state, and that is a durability
+change, not a context one — a `StateBackend` keeps file contents out of the
+message thread just as well. Disk is what lets you read `workspace/notes.md`
+afterwards and see what the agent actually wrote down.
 
 **The tools layer** (`repo_cartographer/tools.py`) is intentionally free of any
 LLM or agent code. It's ordinary, testable Python:
@@ -316,12 +367,15 @@ print(get_file_contents("pallets", "flask", "pyproject.toml"))
 repo-cartographer/
 ├── repo_cartographer/
 │   ├── __init__.py      Package docstring; re-exports the GitHub tools
-│   ├── agent.py         ORCHESTRATOR_PROMPT, the agent, and ask()
-│   ├── middleware.py    Hides the built-in tools Phase 2 doesn't use
+│   ├── agent.py         ORCHESTRATOR_PROMPT, build_agent(), ask()
+│   ├── middleware.py    Hides the built-in tools this phase doesn't use
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
 │   └── tools.py         GitHub API functions — no LLM code
+├── scripts/
+│   └── measure_context.py   Phase 3's A/B: offloading on vs. off
 ├── tests/
 │   └── test_tools.py    Live tests against the real GitHub API
+├── workspace/           The agent's scratch space — git-ignored, run output
 ├── main.py              CLI: uv run main.py "your question"
 ├── .env.example         Template for your keys — copy to .env
 ├── IMPLEMENTATION_GUIDE.md   The phased build plan
@@ -329,9 +383,15 @@ repo-cartographer/
 └── uv.lock              Exact pinned versions
 ```
 
-`agent.py` holds the prompt because the prompt *is* Phase 2: with no filesystem
-backend and no sub-agents yet, the orchestrator prompt and the three tool
-docstrings are the entire specification of the agent's behaviour.
+`agent.py` holds the prompt because the prompt is still most of the agent: with
+no sub-agents and no skills yet, the orchestrator prompt and the three tool
+docstrings are nearly the whole specification of its behaviour.
+
+`build_agent()` takes exactly one argument, `tool_result_token_limit`, and that
+is deliberate — it is the variable Phase 3 measures. Passing `None` disables
+offloading and gives the control arm: same prompt, same tools, same workspace,
+but large tool results stay inline. `agent` is the module-level default with
+offloading on.
 
 Note that `agent` is deliberately *not* re-exported from `__init__.py`.
 Importing it builds an LLM client and needs a provider key immediately, so
@@ -346,11 +406,19 @@ it from its own module: `from repo_cartographer.agent import agent`.
 ```bash
 uv run ruff check .          # lint
 uv run ruff check . --fix    # lint and autofix
-uv run mypy repo_cartographer/   # type check
+uv run mypy repo_cartographer/ scripts/   # type check
 uv run pytest                # tests (skips the slow one)
 uv run pytest -m slow        # the one slow test: a large repo's tree
 uv run pytest -v --log-cli-level=INFO   # verbose, with live logs
+
+uv run scripts/measure_context.py               # Phase 3's A/B, 2 model runs
+uv run scripts/measure_context.py --repeats 3   # ...with ranges, 6 model runs
 ```
+
+`measure_context.py` spends real model quota — two runs per `--repeats`, each a
+full repository mapping. Point it at a repo with files large enough to cross the
+2,000-token eviction threshold or it will correctly report that nothing was
+offloaded and the difference is noise.
 
 The test suite calls GitHub for real rather than mocking it, which means it can
 be affected by your rate limit. It's built to tell the difference: a spent quota
@@ -427,9 +495,10 @@ bigger model costs you the ability to run at all:
 
 `gemma-4-31b` is the interesting one: effectively unlimited requests, but 16K
 input tokens/minute, which an agent loop exceeds within a few turns because it
-resends the whole history each time. That becomes usable once **Phase 3's
-filesystem backend** stops file contents from living in every turn — a concrete
-reason to build it.
+resends the whole history each time. Phase 3's offloading helps here and was
+partly built for it, though not enough to rescue this model on a real repo: the
+measured `psf/requests` run still reached 21K tokens on its final turn with
+offloading on. The ceiling moved; it is still below what the task needs.
 
 ### Why Gemini needs its native client
 
@@ -458,10 +527,13 @@ parameters). Measured on the same `psf/requests` ask, it:
 - reached a correct answer, just wastefully.
 
 Multi-step tool use is where small models fall down first, and this task is
-nothing but multi-step tool use. Both problems are now fixed from two directions:
-a capable-enough model, and
-[`middleware.py`](repo_cartographer/middleware.py) removing the workspace tools
-so the second failure is not even reachable.
+nothing but multi-step tool use. The planning failure was fixed by moving to a
+capable-enough model. The wasted `read_file` calls were fixed at Phase 2 by
+hiding the workspace tools outright; Phase 3 gives them back, so what now keeps
+the model from repeating that mistake is the prompt drawing the line between a
+remote read-only repository and a local workspace that starts empty — a weaker
+guarantee than removal, and the reason the distinction is stated twice in
+[`ORCHESTRATOR_PROMPT`](repo_cartographer/agent.py).
 
 ### If you stay on OpenRouter
 

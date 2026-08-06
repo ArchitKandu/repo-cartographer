@@ -11,4 +11,8 @@ wheels/
 
 # Environment variables
 .env
+
+# Agent scratch space: the workspace the filesystem backend writes notes into.
+# Run output, not source — regenerated on every run.
 tmp/
+workspace/
