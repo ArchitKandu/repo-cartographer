@@ -29,7 +29,7 @@ reasoning behind the ordering.
 | 2 | Bare agent (tools + prompt) | Done |
 | 3 | Filesystem backend | Done |
 | 4a | Explorer + doc-writer sub-agents | Done |
-| 4b | Parallel fan-out per directory | Done — this is what runs today |
+| 4b | Parallel fan-out per directory | **Done — trace verified, this is what runs today** |
 | 5+ | Evals, link-checker, skills | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
@@ -86,40 +86,58 @@ in its own context window rather than one long growing thread.
 ```
 agent             turns  tool calls   cumulative in   peak in
 -------------------------------------------------------------
-orchestrator         11          11          60,819     7,861
-explorer 1           11          10         113,964    18,778
-explorer 2            9          15         142,194    25,839
-doc-writer            3           3           7,582     4,515
+orchestrator         10          10          53,739     6,997
+explorer 1            5           4          29,329     8,789
+explorer 2            9          12          87,689    13,564
+doc-writer            3           3           7,011     3,888
 -------------------------------------------------------------
-whole run            34          39         324,559    25,839
+whole run            27          29         177,768    13,564
 
 Dispatch shape: [2, 1] — 2 message(s) issuing 3 task call(s), at most 2 at once.
 ```
 
-81% of the run's input tokens were carried in sub-agent threads and never entered
-the orchestrator's. Its own peak context was 7,861 tokens while an explorer's was
-25,839 — that gap is the quarantine, and on one thread all of it would have been
+70% of the run's input tokens were carried in sub-agent threads and never entered
+the orchestrator's. Its own peak context was 6,997 tokens while an explorer's was
+13,564 — that gap is the quarantine, and on one thread all of it would have been
 the same thread.
 
-That last line is the 4b check. Concurrency here is not something the library
-arranges: it is the model emitting several `task` calls in *one* assistant message.
-`[2, 1]` means two explorers went out together — `src` and `.` — and the
-doc-writer followed once both had reported. A run that dispatched them `[1, 1, 1]`
-would do identical work in identically isolated contexts and no other number in
-this table would tell you, which is why the shape is measured rather than assumed.
+**The trace confirms it independently.** With `LANGSMITH_TRACING=true`, the same run
+appears in LangSmith as one root run with the sub-agents nested inside it — 31 runs
+tagged `ls_agent_type=subagent`, and three `task` invocations with their own token
+totals:
 
-**The total did not go down, and that is the honest headline.** Delegation adds
-turns: a brief to write, a report to relay, a guide to pass through, and with 4b a
-scope list to read and two explorers to brief separately. Four agents cost more in
-total than one did — 324k input tokens against Phase 3's 211k for the same
-question. What you buy is the peak and the isolation: the doc-writer composed that
-whole guide inside 4,515 tokens, because all it ever saw was two notes files.
+```
+start 11:49:45.338  end 11:50:56.041   explorer     89,426 tokens   70.7s
+start 11:49:45.348  end 11:50:20.851   explorer     30,595 tokens   35.5s
+start 11:51:15.864  end 11:51:32.711   doc-writer    7,863 tokens   16.8s
 
-Two things worth noticing. Each explorer's context is *larger* than anything Phase
-3 measured, because they are the agents doing all the reading now — which is why
-Phase 3's eviction threshold is restated in the explorer spec rather than left at
-the library default. And `scripts/measure_context.py` can no longer see any of
-this: it reads a finished run's `state["messages"]`, which is the orchestrator's
+explorer wall-clock overlap: 35.5s → CONCURRENT
+```
+
+The two explorers started **10 milliseconds apart** and ran together for 35.5
+seconds. That is Phase 4's definition of done, met twice over: locally as tokens
+per thread, and server-side as wall-clock overlap. Concurrency here is not
+something the library arranges — it is the model choosing to emit two `task` calls
+in *one* message. A run that sent them one per message would do identical work in
+identically isolated contexts, and no token figure would tell the two apart, which
+is why both the dispatch shape and the overlap are measured rather than assumed.
+
+**On cost, one run proves nothing, and an earlier draft of this README overclaimed.**
+This run totalled 177,768 input tokens — *below* Phase 3's 211,386. An earlier 4b
+run on the identical question totalled 324,559. The spread between two runs of the
+same architecture is far wider than the gap between architectures, because the
+dominant variable is how many files the explorers happened to open. So: no cost
+claim in either direction from single runs. `scripts/measure_context.py` has warned
+about exactly this since Phase 3 (`--repeats N`, and it says so itself when ranges
+overlap); the same caution applies here.
+
+What *is* robust is the split, because it is structural rather than a function of
+file choices: the orchestrator stays small no matter how much reading happens, and
+the doc-writer composed that entire guide inside 3,888 tokens because all it ever
+saw was two notes files.
+
+One more thing worth noticing: `scripts/measure_context.py` can no longer see any
+of this. It reads a finished run's `state["messages"]`, which is the orchestrator's
 thread alone. Its numbers fell sharply at Phase 4 for a reason that is not a
 saving, and its docstring now says so.
 
@@ -144,9 +162,11 @@ which is the only correct arrangement, since the provider's limit is per project
 not per agent.
 
 **So on a per-minute request budget, concurrency buys no wall-clock speed at all.**
-Two explorers finish no sooner than the bucket refills. What the fan-out actually
-buys is the smaller peak — 25,839 tokens across two threads instead of one thread
-holding everything — and that is the honest claim to make for it. `max_bucket_size`
+The trace above shows it: two explorers overlapping for 35.5s, and the slower one
+still taking 70.7s because it spent much of that waiting for the queue. What the
+fan-out actually buys is the smaller peak — 13,564 tokens across two threads
+instead of one thread holding everything — and that is the honest claim to make for
+it. `max_bucket_size`
 is deliberately 1: a bucket that banked unused capacity would let both explorers
 start at once and spend the whole minute's budget immediately, which is the failure
 it exists to prevent.
@@ -531,6 +551,7 @@ repo-cartographer/
 ├── main.py              CLI: uv run main.py "your question"
 ├── .env.example         Template for your keys — copy to .env
 ├── ARCHITECTURE.md      How the whole system works, start to finish
+├── langgraph.json       Graph entry point for LangGraph Studio / Platform
 ├── IMPLEMENTATION_GUIDE.md   The phased build plan
 ├── pyproject.toml       Dependencies and tool config
 └── uv.lock              Exact pinned versions

@@ -254,7 +254,7 @@ brief carries the owner, the repo, **its own** scope, the question in full, and
 ### Step 4 · each explorer works in its own conversation
 
 ```
-explorer #1 (scope: src)          explorer #2 (scope: root)
+explorer (scope: src)             explorer (scope: root)
 ──────────────────────────        ──────────────────────────
 get_repo_tree → filter to src/    get_repo_tree → filter to root
 get_file_contents __init__.py     get_file_contents pyproject.toml
@@ -288,7 +288,7 @@ Then each returns a **three-line spoken report** — not the notes:
 > scope; skipped tests and packaging metadata.
 
 That report is all the orchestrator ever sees. The 800-line `sessions.py` stays in
-explorer #1's conversation and never touches the orchestrator's.
+that explorer's conversation and never touches the orchestrator's.
 
 ### Step 5 · the orchestrator verifies
 
@@ -402,32 +402,36 @@ obvious alternative fails in a specific way.
 
 Same question, same repository, three architectures:
 
-| | Phase 3 · one agent | Phase 4a · one explorer | Phase 4b · two explorers |
+| | Phase 3 · one agent | Phase 4b · run A | Phase 4b · run B |
 |---|---|---|---|
-| Total input tokens | 211,386 | 147,948 | 324,559 |
-| **Largest single conversation** | 21,443 | 23,780 | 25,839 |
-| The orchestrator's own peak | — | 6,113 | **7,861** |
-| Turns | ~15 | 19 | 34 |
+| Total input tokens | 211,386 | 324,559 | 177,768 |
+| **Largest single conversation** | 21,443 | 25,839 | 13,564 |
+| The orchestrator's own peak | — | 7,861 | **6,997** |
+| Turns | ~15 | 34 | 27 |
 
-Read those numbers carefully, because two of them are traps.
+Read those numbers carefully, because the obvious conclusions are traps.
 
-**The total went up, not down.** Delegation adds work: a scope list to read, briefs
-to write, reports to relay, a guide to pass through. Four agents cost more than one
-did. Anyone claiming multi-agent systems are cheaper is usually measuring the wrong
-thing.
+**Do not draw a cost conclusion from single runs.** Two runs of the *same*
+architecture on the *identical* question came out at 324,559 and 177,768 — one above
+Phase 3's total, one below it. The spread between runs of one architecture is wider
+than the gap between architectures, because the dominant variable is how many files
+the explorers happened to open, and that is a model decision that changes every
+time. An earlier draft of this document claimed Phase 4 "costs more"; that claim was
+built on one run and it does not survive a second. `scripts/measure_context.py` has
+carried this warning since Phase 3 — it takes `--repeats N` and says so itself when
+the ranges overlap.
 
-**The Phase 4a total looks like a saving and is not.** 147,948 against Phase 3's
-211,386 is the same trap in reverse — that figure came from an instrument that
-could only see the orchestrator's thread. `scripts/measure_context.py` reads a
-finished run's message list, which after Phase 4 is the orchestrator's conversation
-alone. Its numbers collapsed because the tokens **moved somewhere it cannot see.**
-A number that fell because you stopped measuring is worse than no number, because
-you will quote it. `scripts/show_contexts.py` exists to see all four threads, by
-streaming with `subgraphs=True`.
+**And do not trust the old instrument at all now.** `scripts/measure_context.py`
+reads a finished run's message list, which after Phase 4 is the orchestrator's
+conversation *alone*. Its figures collapsed at Phase 4 because the tokens **moved
+somewhere it cannot see.** A number that fell because you stopped measuring is worse
+than no number, because you will quote it. `scripts/show_contexts.py` exists to see
+all four threads, by streaming with `subgraphs=True`.
 
-**So what did you actually buy?** The orchestrator peaked at 7,861 tokens while the
-reading happened elsewhere; the doc-writer produced that entire guide inside 4,515
-tokens because all it ever saw was two note files. **Nobody has to hold the whole
+**So what did you actually buy?** The part that is structural rather than a function
+of file choices. The orchestrator stays small no matter how much reading happens —
+6,997 tokens here — and the doc-writer produced the entire guide inside 3,888
+tokens, because all it ever saw was two note files. **Nobody has to hold the whole
 repository at once.** That is what lets this scale to a repository where one growing
 conversation would hit a hard wall.
 
@@ -501,21 +505,56 @@ anywhere**. So it is asserted mechanically, in a second, for free.
   private structure, so it is the test most likely to break on an upgrade. If it
   does, that is a signal worth reading, not a test worth deleting.
 
-Add `LANGSMITH_TRACING=true` and a key to `.env` for a clickable trace showing all
-four conversations nested. It is provider-independent and costs nothing against
-your model quota.
+### The trace
+
+`LANGSMITH_TRACING=true` plus a key in `.env` records every run in LangSmith, with
+the sub-agents nested inside the root run. `langgraph.json` points at the same graph
+for LangGraph Studio. Tracing is provider-independent — it records what the graph
+did, not who served the model — so it costs nothing against your model quota.
+
+A traced run of the example above produced one root run containing **31 runs tagged
+`ls_agent_type=subagent`** and three `task` invocations:
+
+```
+start 11:49:45.338  end 11:50:56.041   explorer     89,426 tokens   70.7s
+start 11:49:45.348  end 11:50:20.851   explorer     30,595 tokens   35.5s
+start 11:51:15.864  end 11:51:32.711   doc-writer    7,863 tokens   16.8s
+```
+
+The two explorers started **10 milliseconds apart** and overlapped for 35.5 seconds.
+That is the concurrency claim confirmed server-side, from timestamps rather than
+inference — and it is a different kind of evidence from the token table, which shows
+the contexts were *separate* but not that they were *simultaneous*.
+
+Notice the first explorer took 70.7s while overlapping for only 35.5s of it. Most of
+that remainder was spent waiting on the shared request queue, which is the rate limit
+made visible.
 
 ---
 
 ## Known limitations
 
-**Scope discipline is imperfect.** In the run above, the explorer scoped to `.`
-read into `src/` anyway, despite the prompt telling it to record cross-scope
-dependencies and stop. Both notes files ended up describing `src/requests/`, and
-that explorer cost *more* than the one whose actual job was `src/` — 142,194 tokens
-against 113,964, with 15 tool calls against 10. Duplicated reading, paid for twice.
-This is a prompt-adherence problem on a small model, and it is precisely the kind
-of regression Phase 5's eval set is meant to catch and measure.
+**Scope discipline is imperfect, in every run observed so far.** The explorer scoped
+to `.` reads into `src/` anyway, despite the prompt telling it to record a
+cross-scope dependency and stop. The evidence is the explorer's own notes file,
+which lists what it opened:
+
+```
+Read files: pyproject.toml, setup.py, src/requests/__init__.py,
+            src/requests/api.py, src/requests/sessions.py,
+            src/requests/adapters.py
+                        ↑ four files belonging to another explorer's scope
+```
+
+Severity varies. In one run the root explorer cost *more* than the `src` explorer —
+142,194 tokens against 113,964 — which is the drift at its worst: the same files read
+twice and paid for twice. In the traced run it stayed proportionate (30,595 against
+87,689, matching the 8-vs-42 file split), but it still crossed the line.
+
+That variability is the real problem. A rule followed most of the time cannot be
+verified by looking at one run, which is exactly the argument for Phase 5: an eval
+set turns "it seemed fine when I looked" into a number that moves when you change a
+prompt.
 
 **The guide can still repeat an explorer's mistake.** The doc-writer cannot invent a
 path, but it will faithfully reproduce a wrong one. Verifying cited paths against
@@ -548,7 +587,7 @@ credited with the change it caused. See
 | 2 | What the agent harness buys over a bare loop | Done |
 | 3 | Context offloading | Done |
 | 4a | Context quarantine | Done |
-| 4b | Parallel fan-out | Done |
+| 4b | Parallel fan-out | Done — trace verified |
 | 5 | Measurable regressions (eval set) | Next |
 | 6 | Sub-agents ≠ smaller AI calls (link-checker) | Planned |
 | 7 | Prompt decomposition (skills) | Planned |

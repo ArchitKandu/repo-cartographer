@@ -9,6 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
+# Tool caches. Listed here rather than left to a global gitignore, so a fresh
+# clone on someone else's machine stays clean too.
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # Environment variables
 .env
 
