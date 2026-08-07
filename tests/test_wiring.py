@@ -53,19 +53,26 @@ needs_model = pytest.mark.skipif(not _HAS_KEY, reason="no provider key configure
 # derived from the code, so a change to the split has to be made twice — once in
 # `agent.py` and once here, deliberately.
 GITHUB_TOOLS = {"get_repo_tree", "get_file_contents", "search_code"}
+
+# The tools that read what a repository *says*. `get_repo_scopes` is deliberately
+# not in here: it reports directory names and file counts, which is shape, not
+# content. That distinction is the one 4b rests on, so it gets its own name.
+CONTENT_TOOLS = GITHUB_TOOLS
 EXPECTED = {
-    # The orchestrator delegates and checks. It reads the workspace to confirm its
-    # explorers wrote something; it reaches GitHub through `task` or not at all.
-    "orchestrator": {"ls", "read_file", "task", "write_todos"},
+    # The orchestrator divides, delegates and checks. `get_repo_scopes` is how it
+    # learns a repository has a `src/` worth exploring; everything about what is
+    # *in* src/ comes back through `task`.
+    "orchestrator": {"get_repo_scopes", "ls", "read_file", "task", "write_todos"},
     "explorer": GITHUB_TOOLS | {"read_file", "write_file"},
     # The whole design in one line. Two read-only tools, no repository access.
     "doc-writer": {"ls", "read_file"},
 }
 
-# Every deepagents built-in that could show up if a restriction stopped working.
-# Used to check prompts against reality: a prompt that names one of these is
+# Every tool name that exists anywhere in the system: the deepagents built-ins
+# that could show up if a restriction stopped working, plus this project's own.
+# Used to check prompts against reality — a prompt that names one of these is
 # telling its agent about a tool it may not have.
-ALL_BUILTINS = {
+ALL_TOOL_NAMES = {
     "ls",
     "read_file",
     "write_file",
@@ -76,6 +83,8 @@ ALL_BUILTINS = {
     "execute",
     "task",
     "write_todos",
+    "get_repo_scopes",
+    *GITHUB_TOOLS,
 }
 
 
@@ -218,8 +227,15 @@ def test_prompt_names_no_tool_its_agent_lacks(agent_name: str, prompt: str) -> N
     `ls` the workspace is somewhere else entirely. The model then spends a turn on
     a tool it was promised and does not have, and the transcript reads like a model
     failure rather than a documentation one.
+
+    Both spellings count: the prompts introduce some tools bare (`` `ls` ``) and
+    others with their signature (`` `get_repo_scopes(owner, repo)` ``), and a check
+    that only caught the first would quietly pass on every tool documented properly.
     """
-    named = {name for name in ALL_BUILTINS if f"`{name}`" in prompt}
+    named = {
+        name for name in ALL_TOOL_NAMES if f"`{name}`" in prompt or f"`{name}(" in prompt
+    }
+    assert named, f"{agent_name} prompt names no tools at all — is the regex right?"
     assert named <= EXPECTED[agent_name], f"{agent_name} prompt over-promises"
 
 
@@ -300,14 +316,18 @@ def test_compiled_orchestrator_sees_only_its_four_tools(compiled: Any) -> None:
 
 
 @needs_model
-def test_compiled_orchestrator_holds_no_github_tool(compiled: Any) -> None:
-    """`tools=[]` on the parent, checked at the graph rather than the call site.
+def test_compiled_orchestrator_can_see_shape_but_not_content(compiled: Any) -> None:
+    """The 4b boundary, checked at the graph rather than the call site.
 
-    Leave the GitHub tools on the orchestrator and it uses them instead of
-    delegating — the trace comes out identical to Phase 3 and the phase measures
-    nothing.
+    The orchestrator needs to know a repository has a `src/` in order to fan out
+    across it, and must not be able to read what is inside — leave a content tool
+    here and it stops delegating, because delegating costs it a turn and a model
+    takes the shorter path. The trace then comes out identical to Phase 3 and the
+    phase measures nothing.
     """
-    assert not _tool_node_names(compiled) & GITHUB_TOOLS
+    held = _tool_node_names(compiled)
+    assert "get_repo_scopes" in held
+    assert not held & CONTENT_TOOLS
 
 
 @needs_model

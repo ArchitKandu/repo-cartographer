@@ -31,6 +31,7 @@ from repo_cartographer.tools import (
     GitHubError,
     _headers,
     get_file_contents,
+    get_repo_scopes,
     get_repo_tree,
     search_code,
 )
@@ -339,6 +340,83 @@ def test_tree_raises_rather_than_truncating():
     with pytest.raises(GitHubError, match="truncated") as caught:
         get_repo_tree("torvalds", "linux")
     show("raised", str(caught.value))
+
+
+# --- get_repo_scopes -------------------------------------------------------
+#
+# Phase 4b's input. The orchestrator has no way to read a repository, so this is
+# how it learns there is a `src/` worth one explorer and a `docs/` worth none.
+# Every property below is deterministic, which is the point: the fan-out is only
+# as sensible as the scope list it is handed, and that list should never be a
+# judgement call.
+
+
+@pytest.fixture(scope="module")
+def nested_scopes() -> list[dict]:
+    log.info("[fixture] get_repo_scopes(%s, %s) — one API call, reused", NESTED_OWNER, NESTED_REPO)
+    scopes = get_repo_scopes(NESTED_OWNER, NESTED_REPO)
+    show("nested_scopes", scopes)
+    return scopes
+
+
+def test_scopes_have_the_shape_the_prompt_promises(nested_scopes):
+    step("checking every entry is {'scope': str, 'files': int}")
+    assert nested_scopes
+    for entry in nested_scopes:
+        assert set(entry) == {"scope", "files"}
+        assert isinstance(entry["scope"], str)
+        assert isinstance(entry["files"], int)
+        assert entry["files"] > 0
+
+
+def test_scopes_are_top_level_only(nested_scopes):
+    """A scope containing a slash would be a subdirectory, not a fan-out unit."""
+    step("checking no scope name contains a path separator")
+    show("scope names", [e["scope"] for e in nested_scopes])
+    assert not any("/" in e["scope"] for e in nested_scopes)
+
+
+def test_scopes_account_for_every_file_in_the_tree(nested_tree, nested_scopes):
+    """The invariant that makes the fan-out safe: no file belongs to no explorer.
+
+    Compared against the tree fixture rather than a hardcoded number, so the test
+    keeps working as flask changes. If these ever disagree, some file is in a scope
+    nobody was told to explore — and it would go unread with no error anywhere.
+    """
+    counted = sum(e["files"] for e in nested_scopes)
+    step(f"checking scope counts sum to the tree size: {counted} vs {len(nested_tree)}")
+    assert counted == len(nested_tree)
+
+
+def test_root_files_get_their_own_scope(nested_tree, nested_scopes):
+    """flask has a root-level pyproject.toml, so "." must be present and correct."""
+    step('checking root-level files are grouped under "."')
+    expected = sum(1 for path in nested_tree if "/" not in path)
+    by_name = {e["scope"]: e["files"] for e in nested_scopes}
+    show("root-level files", [p for p in nested_tree if "/" not in p])
+    assert by_name["."] == expected
+
+
+def test_scopes_are_ordered_largest_first(nested_scopes):
+    """Ordering is load-bearing: the orchestrator reads the top of the list first."""
+    step("checking the sort is (-files, name)")
+    keys = [(-e["files"], e["scope"]) for e in nested_scopes]
+    assert keys == sorted(keys)
+
+
+def test_scopes_cost_one_request(nested_scopes):
+    """A tool the orchestrator calls on every run should not walk the repository.
+
+    Asserted through the quota probe the module already uses, because the cheap
+    mistake here is a per-directory implementation that works fine on flask and
+    quietly costs hundreds of requests on something larger.
+    """
+    before = _probe_quota()["remaining"]
+    get_repo_scopes(TINY_OWNER, TINY_REPO)
+    after = _probe_quota()["remaining"]
+    # Two probe calls bracket one scopes call; the probes cost 1 each.
+    step(f"quota went {before} → {after} across one get_repo_scopes call plus probes")
+    assert before - after <= 3
 
 
 # --- get_file_contents ----------------------------------------------------

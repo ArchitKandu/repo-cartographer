@@ -1,10 +1,16 @@
-"""Repo Cartographer's GitHub layer: list a repo's files, read one, search them.
+"""Repo Cartographer's GitHub layer: size a repo up, list its files, read one, search them.
 
-The whole of the agent's access to a repository, and deliberately free of any
-LLM or agent code — three ordinary functions over the GitHub REST API, testable
+The whole of the system's access to a repository, and deliberately free of any
+LLM or agent code — four ordinary functions over the GitHub REST API, testable
 on their own. Every failure mode raises `GitHubError` (the API said no) or
 `ValueError` (the argument pointed somewhere unreadable), so a caller can tell
 an API problem from a bad path.
+
+The functions are not all handed to the same agent, and the line between them is
+deliberate: `get_repo_scopes` reports a repository's *shape* — how many top-level
+areas and how big each is — while the other three read what it *says*. Only the
+first goes to the orchestrator, which is what lets it divide the work across
+explorers without being able to do the work itself. See `agent.py`.
 """
 
 import base64
@@ -86,7 +92,45 @@ def get_repo_tree(owner: str, repo: str, ref: str = "HEAD") -> list[str]:
 
     return [item['path'] for item in tree_data.get('tree', []) if item.get('type') == 'blob']
 
-def get_file_contents(owner: str, repo: str, path: str) -> str: 
+def get_repo_scopes(owner: str, repo: str, ref: str = "HEAD") -> list[dict]:
+    """
+    List a repository's top-level directories with a file count for each, largest first.
+
+    Use this to decide how to divide up a repository before exploring it. It
+    reports the *shape* of the repo — how many top-level areas there are and how
+    much is in each — and deliberately reveals nothing about what any file
+    contains. Files sitting at the repository root are grouped under the scope
+    ".".
+
+    Costs a single GitHub request no matter how large the repository is.
+
+    Args:
+        owner (str): The owner of the repository.
+        repo (str): The name of the repository.
+        ref (str): The reference to inspect (default is "HEAD").
+
+    Returns:
+        list[dict]: One entry per top-level scope, each `{"scope": str, "files": int}`,
+            sorted by file count descending then by name.
+
+    Raises:
+        GitHubError: if GitHub rejects the request, or truncated the tree.
+    """
+    # Built on get_repo_tree rather than a second endpoint so both see exactly the
+    # same repository: one source of truth for which paths exist, and the
+    # truncation guard is inherited rather than reimplemented.
+    counts: dict[str, int] = {}
+    for path in get_repo_tree(owner, repo, ref):
+        scope = path.split("/")[0] if "/" in path else "."
+        counts[scope] = counts.get(scope, 0) + 1
+
+    return [
+        {"scope": scope, "files": files}
+        for scope, files in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+
+def get_file_contents(owner: str, repo: str, path: str) -> str:
     """
     Get the contents of a file in a GitHub repository.
     

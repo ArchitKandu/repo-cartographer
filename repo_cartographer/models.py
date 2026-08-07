@@ -36,6 +36,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
@@ -47,6 +48,26 @@ from pydantic import SecretStr
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Requests per minute each free tier allows, and the reason a rate limiter exists
+# here at all. Phase 4b dispatches up to three explorers concurrently, and three
+# agents stepping through their own tool loops at once reach a per-minute ceiling
+# in seconds: the first fan-out run attempted here died mid-explorer on
+# `429 RESOURCE_EXHAUSTED ... limit: 15`, with the API itself suggesting a retry
+# one second later.
+#
+# The lesson is worth stating plainly, because it is the real cost of the fan-out:
+# on a request-per-minute budget, concurrency does not buy wall-clock speed. Three
+# explorers still finish no faster than the bucket refills. What parallelism buys
+# is the thing Phase 4 is actually about — three separate context windows — and the
+# limiter is what makes that survivable rather than a burst of 429s.
+_REQUESTS_PER_MINUTE = {"google": 15, "openrouter": 20}
+
+# Spend the budget at 80% of the ceiling. The remaining fifth is for the fact that
+# a limiter meters *our* requests, not the provider's accounting of them: retries
+# inside the SDK, and clock skew between the bucket and the server's window, both
+# land on the wrong side of an exactly-tuned rate.
+_RATE_LIMIT_HEADROOM = 0.8
 
 # 500 requests/day at 15/minute — the most headroom Google's free tier offers.
 _DEFAULT_GOOGLE_MODEL = "gemini-3.5-flash-lite"
@@ -68,6 +89,33 @@ _NO_KEYS = (
     "https://aistudio.google.com/apikey) or OPENROUTER_API_KEY (at "
     "https://openrouter.ai/keys) in .env at the repo root."
 )
+
+
+def _rate_limiter(provider: str) -> InMemoryRateLimiter:
+    """A shared request budget for every agent in a run.
+
+    One limiter instance is attached to the one chat model, and sub-agents inherit
+    that instance rather than building their own — so the orchestrator and all
+    three explorers draw from a single bucket. That is what makes the accounting
+    correct: the provider's limit is per project, not per agent, so three private
+    limiters set to the same rate would together spend three times the budget.
+
+    Override the rate with `REQUESTS_PER_MINUTE` when you are on a paid tier and the
+    ceiling is not 15.
+    """
+    configured = os.environ.get("REQUESTS_PER_MINUTE")
+    per_minute = float(configured) if configured else _REQUESTS_PER_MINUTE[provider]
+    return InMemoryRateLimiter(
+        requests_per_second=per_minute * _RATE_LIMIT_HEADROOM / 60,
+        # How often a waiting caller re-checks the bucket. Well below the interval
+        # between grants, so a freed slot is taken promptly rather than adding a
+        # second of latency to every request.
+        check_every_n_seconds=0.1,
+        # No bursting. A bucket that banks unused capacity would let three explorers
+        # start simultaneously and spend the whole minute's budget at once, which is
+        # precisely the failure this exists to prevent.
+        max_bucket_size=1,
+    )
 
 
 def _build_model() -> tuple[BaseChatModel, str]:
@@ -100,7 +148,11 @@ def _build_model() -> tuple[BaseChatModel, str]:
             )
         google_model = os.environ.get("GOOGLE_MODEL", _DEFAULT_GOOGLE_MODEL)
         return (
-            ChatGoogleGenerativeAI(model=google_model, api_key=SecretStr(google_key)),
+            ChatGoogleGenerativeAI(
+                model=google_model,
+                api_key=SecretStr(google_key),
+                rate_limiter=_rate_limiter("google"),
+            ),
             # `google_genai` is the provider name langchain reports for this class,
             # and Gemini model names contain no colon, so the joined form is what
             # deepagents looks up first.
@@ -119,6 +171,7 @@ def _build_model() -> tuple[BaseChatModel, str]:
                 model=openrouter_model,
                 base_url=_OPENROUTER_BASE_URL,
                 api_key=SecretStr(openrouter_key),
+                rate_limiter=_rate_limiter("openrouter"),
             ),
             # Not `openai:<model>`. OpenRouter model names carry their own colon
             # (`vendor/model:free`), and deepagents refuses any key with more than

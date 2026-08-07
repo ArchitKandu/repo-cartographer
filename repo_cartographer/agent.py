@@ -1,11 +1,18 @@
 """Repo Cartographer's agent — Phase 4: one orchestrator, two sub-agents.
 
 Phase 3 was one agent with a workspace. Phase 4 changes one thing: the work is
-split three ways. An `explorer` holds the GitHub tools and reads code; a
+split three ways. An `explorer` holds the reading tools and reads code; a
 `doc-writer` holds no repository access at all and writes the guide from the
-explorer's notes; the orchestrator holds neither and only delegates. No skills
-yet (Phase 7). Everything the system knows about a repository it learns at run
-time through `tools.py`.
+explorers' notes; the orchestrator holds only `get_repo_scopes`, which reports a
+repository's shape and never its contents, and divides the work on that basis. No
+skills yet (Phase 7). Everything the system knows about a repository it learns at
+run time through `tools.py`.
+
+4b added the fan-out: rather than one explorer over the whole repository, the
+orchestrator reads the scope list and dispatches up to three explorers — one per
+top-level directory — in a single message, so they run concurrently in separate
+threads. The cap is a budget rather than a design preference; see
+ORCHESTRATOR_PROMPT on why a fourth explorer makes a run fail instead of better.
 
 The mechanism the phase is about is context quarantine. Each sub-agent runs in
 its own message thread, so a file the explorer reads never enters the
@@ -47,7 +54,12 @@ from repo_cartographer.prompts import (
     EXPLORER_PROMPT,
     ORCHESTRATOR_PROMPT,
 )
-from repo_cartographer.tools import get_file_contents, get_repo_tree, search_code
+from repo_cartographer.tools import (
+    get_file_contents,
+    get_repo_scopes,
+    get_repo_tree,
+    search_code,
+)
 
 # Anchored to this file, not the working directory, for the same reason models.py
 # anchors its .env: a run started from a REPL or another directory should reach
@@ -120,9 +132,12 @@ def build_subagents(
     explorer_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         FilesystemMiddleware(
             backend=backend,
-            # `read_file` for a tree another explorer already fetched, `write_file`
-            # for its own notes. It has no reason to list a directory, or to edit a
-            # file it wrote seconds earlier in a single call.
+            # `write_file` for its own notes, and `read_file` because eviction
+            # needs it: when a tool result crosses the threshold below, the
+            # middleware replaces it with a preview plus a workspace path to read
+            # the rest from, and an explorer without `read_file` cannot follow that
+            # up. Eviction fires here and nowhere else, so this is the one agent for
+            # which `read_file` is load-bearing rather than convenient.
             tools=["read_file", "write_file"],
             # Restated, or Phase 3's mechanism quietly dies here. Sub-agents get a
             # fresh FilesystemMiddleware at the library default of 20_000 tokens —
@@ -234,14 +249,20 @@ def build_agent(
         name="repo_cartographer",
         system_prompt=ORCHESTRATOR_PROMPT,
         model=model,
-        # Empty, and this is the phase's real edit. Leave the GitHub tools here and
-        # the orchestrator keeps using them: delegating costs it a turn and a leap
-        # of faith, and a model takes the shorter path. You would end up with a
-        # `task` tool it never calls, a trace identical to Phase 3, and the
-        # conclusion that sub-agents did not help. Removing the tools makes
-        # delegation the only route to the data, which is what makes the trace mean
-        # something.
-        tools=[],
+        # One tool, and the boundary it draws is the point. Leave the reading tools
+        # here and the orchestrator keeps using them: delegating costs it a turn and
+        # a leap of faith, and a model takes the shorter path. You would end up with
+        # a `task` tool it never calls, a trace identical to Phase 3, and the
+        # conclusion that sub-agents did not help.
+        #
+        # `get_repo_scopes` is the exception 4b requires, because fanning out per
+        # top-level directory means knowing what the directories are, and an
+        # orchestrator holding no GitHub tools at all cannot find out. It returns
+        # directory names and file counts — the repository's *shape* — and no file
+        # contents, so it buys the orchestrator the ability to divide the work
+        # without the ability to do it. Everything about what the code says still
+        # has to come back from an explorer.
+        tools=[get_repo_scopes],
         # Passed as plain functions inside the specs: LangChain derives each tool's
         # schema and description from its signature and docstring, so tools.py stays
         # the single source of truth for what the model knows about them.

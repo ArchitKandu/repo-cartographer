@@ -10,6 +10,10 @@ files are worth opening, reads them, and answers from what it actually found.
 Built on [deepagents](https://pypi.org/project/deepagents/) (a LangGraph agent
 harness) with a small, deliberately boring GitHub tools layer underneath.
 
+**New here?** [ARCHITECTURE.md](ARCHITECTURE.md) explains the whole system from
+scratch — the four agents, how the files connect, and one real run traced step by
+step, with no prior knowledge of the codebase assumed.
+
 ---
 
 ## Status
@@ -21,10 +25,11 @@ reasoning behind the ordering.
 | Phase | What it adds | State |
 |---|---|---|
 | 0 | Environment, packaging, config | Done |
-| 1 | GitHub tools layer + tests | Done — 21 tests, no mocking |
+| 1 | GitHub tools layer + tests | Done — 26 tests, no mocking |
 | 2 | Bare agent (tools + prompt) | Done |
 | 3 | Filesystem backend | Done |
-| 4 | Explorer + doc-writer sub-agents | Done — this is what runs today |
+| 4a | Explorer + doc-writer sub-agents | Done |
+| 4b | Parallel fan-out per directory | Done — this is what runs today |
 | 5+ | Evals, link-checker, skills | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
@@ -71,7 +76,7 @@ it hasn't earned — when nothing crossed the eviction threshold it prints that
 fact rather than the difference, which is exactly what happened on the first repo
 tried, whose only large file was a lockfile the prompt tells the agent to skip.
 
-### Phase 4: three agents, three context windows
+### Phase 4: one thread became four, and two of them ran at once
 
 The definition of done is a trace showing two or more sub-agent invocations, each
 in its own context window rather than one long growing thread.
@@ -81,35 +86,83 @@ in its own context window rather than one long growing thread.
 ```
 agent             turns  tool calls   cumulative in   peak in
 -------------------------------------------------------------
-orchestrator          8           7          35,314     6,113
-explorer              8          14         106,358    23,780
-doc-writer            3           2           6,276     3,196
+orchestrator         11          11          60,819     7,861
+explorer 1           11          10         113,964    18,778
+explorer 2            9          15         142,194    25,839
+doc-writer            3           3           7,582     4,515
 -------------------------------------------------------------
-whole run            19          23         147,948    23,780
+whole run            34          39         324,559    25,839
+
+Dispatch shape: [2, 1] — 2 message(s) issuing 3 task call(s), at most 2 at once.
 ```
 
-76% of the run's input tokens were carried in sub-agent threads and never entered
-the orchestrator's. Its own peak context was 6,113 tokens while the explorer's was
-23,780 — that gap is the quarantine, and on one thread all of it would have been
+81% of the run's input tokens were carried in sub-agent threads and never entered
+the orchestrator's. Its own peak context was 7,861 tokens while an explorer's was
+25,839 — that gap is the quarantine, and on one thread all of it would have been
 the same thread.
 
+That last line is the 4b check. Concurrency here is not something the library
+arranges: it is the model emitting several `task` calls in *one* assistant message.
+`[2, 1]` means two explorers went out together — `src` and `.` — and the
+doc-writer followed once both had reported. A run that dispatched them `[1, 1, 1]`
+would do identical work in identically isolated contexts and no other number in
+this table would tell you, which is why the shape is measured rather than assumed.
+
 **The total did not go down, and that is the honest headline.** Delegation adds
-turns: a brief to write, a report to relay, a guide to pass through. Three agents
-cost more in total than one did. What you buy is the peak and the isolation — the
-doc-writer composed that guide inside 3,196 tokens because all it ever saw was one
-notes file.
+turns: a brief to write, a report to relay, a guide to pass through, and with 4b a
+scope list to read and two explorers to brief separately. Four agents cost more in
+total than one did — 324k input tokens against Phase 3's 211k for the same
+question. What you buy is the peak and the isolation: the doc-writer composed that
+whole guide inside 4,515 tokens, because all it ever saw was two notes files.
 
-Two things worth noticing in those numbers. The explorer's context is *larger*
-than anything Phase 3 measured, because it is the agent doing all the reading now
-— which is why Phase 3's eviction threshold is restated in its spec rather than
-left at the library default; three results were offloaded during that run. And
-`scripts/measure_context.py` can no longer see any of this: it reads a finished
-run's `state["messages"]`, which is the orchestrator's thread alone. Its numbers
-fell sharply at Phase 4 for a reason that is not a saving, and its docstring now
-says so.
+Two things worth noticing. Each explorer's context is *larger* than anything Phase
+3 measured, because they are the agents doing all the reading now — which is why
+Phase 3's eviction threshold is restated in the explorer spec rather than left at
+the library default. And `scripts/measure_context.py` can no longer see any of
+this: it reads a finished run's `state["messages"]`, which is the orchestrator's
+thread alone. Its numbers fell sharply at Phase 4 for a reason that is not a
+saving, and its docstring now says so.
 
-What works right now: an orchestrator that plans and delegates, an explorer that
-reads code and takes notes, and a doc-writer that turns those notes into a guide
+#### The fan-out has a hard cost, and it is not tokens
+
+The first attempt at 4b died mid-run:
+
+```
+ChatGoogleGenerativeAIError: (RESOURCE_EXHAUSTED) 429 ...
+Quota exceeded for metric: generate_content_free_tier_requests, limit: 15
+Please retry in 1.010311967s.
+```
+
+Two explorers and an orchestrator stepping through their own tool loops reached
+15 requests/minute in seconds. The API's own advice — *retry in 1 second* — is the
+tell: this is a pacing problem, not a capacity one, so the fix is a client-side
+rate limiter rather than fewer explorers.
+[`models.py`](repo_cartographer/models.py) attaches one `InMemoryRateLimiter` to
+the single chat model at 80% of the tier's published limit. Because every
+sub-agent inherits that model *instance*, all four agents draw from one bucket —
+which is the only correct arrangement, since the provider's limit is per project,
+not per agent.
+
+**So on a per-minute request budget, concurrency buys no wall-clock speed at all.**
+Two explorers finish no sooner than the bucket refills. What the fan-out actually
+buys is the smaller peak — 25,839 tokens across two threads instead of one thread
+holding everything — and that is the honest claim to make for it. `max_bucket_size`
+is deliberately 1: a bucket that banked unused capacity would let both explorers
+start at once and spend the whole minute's budget immediately, which is the failure
+it exists to prevent.
+
+One more real failure, caught from the same wreckage. That dead run left a file at
+`workspace/workspace/notes/overview.md` — the orchestrator had briefed a path
+*including* the `workspace/` prefix, and since the workspace is the backend root,
+the write succeeded into a second directory inside it. The explorer reported
+success. Nothing errored. The doc-writer would simply have found nothing. Both
+prompts now state the path rule explicitly, because this is the shape of every
+handoff bug in a delegated system: it does not fail, it succeeds somewhere
+useless.
+
+What works right now: an orchestrator that sizes a repository up and splits it
+across up to three explorers, explorers that read one directory each and take
+notes, and a doc-writer that turns those notes into a guide
 with an architecture overview, a where-things-happen table, and an explicit list
 of what went unread. Still ahead: the eval set (Phase 5), citation checking
 (Phase 6), skills (Phase 7). Paths in the guide carry three prompts' instruction
@@ -127,29 +180,33 @@ from the code rather than letting the model invent it.
 
 ```mermaid
 flowchart LR
-    U([Your question]) --> A[Orchestrator<br/>plans, delegates, checks]
+    U([Your question]) --> A[Orchestrator<br/>plans, splits, delegates, checks]
     A <--> M[["LLM<br/>Gemini or OpenRouter"]]
     A --> P[write_todos]
+    A --> S[get_repo_scopes<br/>shape only, 1 request]
     A --> K{task}
-    K --> E[explorer<br/>own context window]
+    K --> E[explorer × up to 3<br/>one per top-level dir<br/>own context window each]
     K --> C[doc-writer<br/>own context window]
     E --> T{GitHub tools}
     T --> T1[get_repo_tree]
     T --> T2[get_file_contents]
     T --> T3[search_code]
     T1 & T2 & T3 --> G[(GitHub REST API)]
-    E -- write_file --> D[("./workspace<br/>notes/overview.md")]
+    E -- write_file --> D[("./workspace<br/>notes/src.md, notes/root.md")]
     D -- read_file --> C
     A -- ls / read_file --> D
     C -- the guide --> A
     A --> R([Answer])
 ```
 
-Three agents, one workspace. The orchestrator has no GitHub tools at all and
-cannot open a file; the explorer has all three and reads code; the doc-writer has
-neither and writes the guide from what the explorer left on disk. Each sub-agent
-runs in its own message thread, so a file the explorer reads never enters the
-orchestrator's context — only the explorer's short final report does.
+Up to five agents, one workspace. The orchestrator can learn a repository's
+*shape* and nothing else — `get_repo_scopes` returns directory names and file
+counts in one request, which is enough to divide the work and not enough to
+describe the code. Each explorer reads one top-level directory and writes its own
+notes file; the doc-writer has no repository access at all and builds the guide
+from those notes. Every sub-agent runs in its own message thread, so a file an
+explorer reads never enters the orchestrator's context — only the explorer's short
+final report does.
 
 Two channels carry work across those boundaries and there are no others: a
 sub-agent's final message, and files in the shared workspace. That constraint is
@@ -169,8 +226,8 @@ there. Every agent gets a deliberately narrow set:
 
 | | GitHub | workspace | other |
 |---|---|---|---|
-| orchestrator | — | `ls`, `read_file` | `task`, `write_todos` |
-| explorer | all three | `read_file`, `write_file` | — |
+| orchestrator | `get_repo_scopes` only | `ls`, `read_file` | `task`, `write_todos` |
+| explorer (×N) | `get_repo_tree`, `get_file_contents`, `search_code` | `read_file`, `write_file` | — |
 | doc-writer | — | `ls`, `read_file` | — |
 
 Two mechanisms produce that table, and they are not interchangeable.
@@ -463,7 +520,7 @@ repo-cartographer/
 │   ├── prompts.py       The three prompts: orchestrator, explorer, doc-writer
 │   ├── middleware.py    Hides the built-ins the orchestrator doesn't use
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
-│   └── tools.py         GitHub API functions — no LLM code
+│   └── tools.py         Four GitHub API functions — no LLM code
 ├── scripts/
 │   ├── measure_context.py   Phase 3's A/B: offloading on vs. off
 │   └── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
@@ -473,6 +530,7 @@ repo-cartographer/
 ├── workspace/           The agent's scratch space — git-ignored, run output
 ├── main.py              CLI: uv run main.py "your question"
 ├── .env.example         Template for your keys — copy to .env
+├── ARCHITECTURE.md      How the whole system works, start to finish
 ├── IMPLEMENTATION_GUIDE.md   The phased build plan
 ├── pyproject.toml       Dependencies and tool config
 └── uv.lock              Exact pinned versions

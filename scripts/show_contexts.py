@@ -119,7 +119,7 @@ def _measure(label: str, messages: list[BaseMessage]) -> Thread:
     )
 
 
-def run(question: str) -> tuple[list[Thread], str]:
+def run(question: str) -> tuple[list[Thread], str, list[int]]:
     """Stream one mapping, collecting messages per agent thread.
 
     `subgraphs=True` is the entire reason this works: without it the stream yields
@@ -145,19 +145,54 @@ def run(question: str) -> tuple[list[Thread], str]:
                     seen.add(id(message))
                     per_namespace[namespace].append(message)
 
+    # Since 4b there can be several explorers in one run, and three rows all
+    # labelled "explorer" would be unreadable. Number repeats in the order the
+    # threads first appeared, which is dispatch order.
+    labels = [_label_for(ns, messages) for ns, messages in per_namespace.items()]
+    seen_labels: dict[str, int] = {}
+    numbered: list[str] = []
+    for label in labels:
+        total = labels.count(label)
+        seen_labels[label] = seen_labels.get(label, 0) + 1
+        numbered.append(f"{label} {seen_labels[label]}" if total > 1 else label)
+
     threads = [
-        _measure(_label_for(namespace, messages), messages)
-        for namespace, messages in per_namespace.items()
+        _measure(label, messages)
+        for label, messages in zip(numbered, per_namespace.values(), strict=True)
     ]
     # Orchestrator first, then sub-agents in the order they were invoked.
     threads.sort(key=lambda t: (t.label != "orchestrator",))
 
     root = per_namespace.get((), [])
     answer = root[-1].text if root else ""
-    return threads, answer
+    return threads, answer, _dispatch_shape(root)
 
 
-def report(threads: list[Thread]) -> None:
+def _dispatch_shape(root: list[BaseMessage]) -> list[int]:
+    """How many `task` calls the orchestrator issued per message.
+
+    4b's claim is that explorers run *concurrently*, and concurrency here is not
+    something the library arranges — it is the model emitting several `task` calls
+    in one assistant message. A run that dispatches them one per message does the
+    same work in the same isolated contexts and takes as many round trips as it has
+    explorers, and nothing else in this report would tell them apart. So the shape
+    of the dispatch is measured rather than assumed: `[2]` is one message asking for
+    two explorers, `[1, 1]` is two messages asking for one each.
+    """
+    return [
+        count
+        for message in root
+        if (
+            count := sum(
+                1
+                for call in (getattr(message, "tool_calls", None) or [])
+                if call.get("name") == "task"
+            )
+        )
+    ]
+
+
+def report(threads: list[Thread], dispatch: list[int]) -> None:
     header = f"{'agent':<16}{'turns':>7}{'tool calls':>12}{'cumulative in':>16}{'peak in':>10}"
     print(f"\n{header}")
     print("-" * len(header))
@@ -179,7 +214,7 @@ def report(threads: list[Thread]) -> None:
         f"{max(t.peak_input_tokens for t in threads):>10,}"
     )
 
-    subagents = [t for t in threads if t.label != "orchestrator"]
+    subagents = [t for t in threads if not t.label.startswith("orchestrator")]
     if not subagents:
         print(
             "\nNo sub-agent threads appeared. The orchestrator answered alone, which "
@@ -200,6 +235,29 @@ def report(threads: list[Thread]) -> None:
         "never entered the orchestrator's. That is the quarantine, in tokens."
     )
 
+    if not dispatch:
+        return
+    concurrent = max(dispatch)
+    print(
+        f"\nDispatch shape: {dispatch} — {len(dispatch)} message(s) issuing "
+        f"{sum(dispatch)} task call(s), at most {concurrent} at once."
+    )
+    if concurrent > 1:
+        print(
+            f"{concurrent} sub-agents were launched in a single message, so they ran "
+            "concurrently. Note what that does and does not buy: separate contexts, "
+            "yes — but with a per-minute request budget the run is no faster, because "
+            "every agent draws from the same bucket (see models.py)."
+        )
+    else:
+        print(
+            "Every task call went out in its own message, so the sub-agents ran one "
+            "after another. The contexts are still isolated and the token figures "
+            "above still hold — but this run did not exercise 4b's fan-out. On a "
+            "weaker model that is a prompt-adherence result worth recording, not a "
+            "bug to hide."
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -214,8 +272,8 @@ def main() -> None:
     question = " ".join(args.question).strip() or EXAMPLE_QUESTION
     print(f"Question: {question}")
 
-    threads, answer = run(question)
-    report(threads)
+    threads, answer, dispatch = run(question)
+    report(threads, dispatch)
 
     if args.answer:
         print(f"\n{'=' * 70}\n{answer}")
