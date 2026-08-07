@@ -1,0 +1,225 @@
+"""Phase 4's definition of done: one thread became three, and here they are.
+
+    uv run scripts/show_contexts.py
+    uv run scripts/show_contexts.py "Explore pallets/flask and explain routing."
+
+The guide asks you to open a LangSmith trace and see two or more sub-agent
+invocations, each with its own smaller context window. This is the same
+observation made locally, as numbers you can paste into a README — useful because
+tracing needs an account and a key, and because a table survives in a commit
+where a screenshot does not.
+
+## Why `scripts/measure_context.py` cannot answer this
+
+That script reads `state["messages"]` from a finished run, which is the
+*orchestrator's* thread and nothing else. After Phase 4 the file reads happen
+inside the explorer, in a thread that never appears there. Its cumulative-token
+figure therefore fell sharply at Phase 4 for a reason that is not a saving: the
+tokens moved somewhere it cannot see. Sub-agent usage is only reachable while the
+run is happening, through `.stream(..., subgraphs=True)`, which is what this file
+does.
+
+That distinction is the whole point of the script. A multi-agent system looks
+cheaper the moment your instrument stops seeing most of the work, and a number
+that fell because you stopped measuring is worse than no number — you will quote
+it.
+
+## Reading the output honestly
+
+- **Cumulative input tokens are the bill.** A message thread is the input to
+  every turn, so a file that lands in it early is paid for again at each turn
+  that follows. The total across all three agents is what the run cost.
+- **Peak input tokens are the crowding.** This is the number quarantine is
+  supposed to move: the largest single context any one agent had to hold. Phase 3
+  reduced it by evicting large results after paying for them once; Phase 4
+  reduces it by never putting them in the parent thread at all.
+- **The total will not go down.** Delegation adds turns — a brief to write, a
+  report to relay — so three agents cost *more* in total than one did. What you
+  are buying is the peak, and the isolation that comes with it. Reporting the
+  total honestly is the difference between measuring and marketing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
+
+# The script lives in scripts/, so the package root is one level up and is not on
+# sys.path when the file is run directly. pyproject's `pythonpath = ["."]` covers
+# pytest, not this.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from repo_cartographer.agent import EXAMPLE_QUESTION, RECURSION_LIMIT, agent
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from langchain_core.messages import BaseMessage
+
+
+class Thread(NamedTuple):
+    """What one agent's message thread cost over a run."""
+
+    label: str
+    cumulative_input_tokens: int
+    """Input tokens summed over this thread's turns — its share of the bill."""
+
+    peak_input_tokens: int
+    """The largest single context this agent had to hold. The number Phase 4 moves."""
+
+    output_tokens: int
+    turns: int
+    tool_calls: int
+
+
+def _label_for(namespace: tuple[str, ...], messages: Iterable[BaseMessage]) -> str:
+    """Name the agent a stream namespace belongs to.
+
+    The root namespace is empty and is always the orchestrator. Sub-agent
+    namespaces are LangGraph-generated strings containing the node and a run id,
+    which identify the *invocation* but not which sub-agent was invoked — so the
+    name is recovered from the tools that appear in the thread, which is the one
+    signal the split guarantees is distinct. Falls back to the raw namespace, since
+    an unlabelled row is still a row and guessing wrong would be worse.
+    """
+    if not namespace:
+        return "orchestrator"
+
+    called = {
+        call.get("name")
+        for message in messages
+        for call in (getattr(message, "tool_calls", None) or [])
+    }
+    if called & {"get_repo_tree", "get_file_contents", "search_code"}:
+        return "explorer"
+    if called <= {"ls", "read_file"} and called:
+        return "doc-writer"
+    return f"sub-agent {namespace[-1].split(':')[0]}"
+
+
+def _measure(label: str, messages: list[BaseMessage]) -> Thread:
+    inputs: list[int] = []
+    outputs = tool_calls = 0
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None)
+        if usage:
+            inputs.append(usage["input_tokens"])
+            outputs += usage["output_tokens"]
+        tool_calls += len(getattr(message, "tool_calls", None) or [])
+    return Thread(
+        label=label,
+        cumulative_input_tokens=sum(inputs),
+        peak_input_tokens=max(inputs, default=0),
+        output_tokens=outputs,
+        turns=len(inputs),
+        tool_calls=tool_calls,
+    )
+
+
+def run(question: str) -> tuple[list[Thread], str]:
+    """Stream one mapping, collecting messages per agent thread.
+
+    `subgraphs=True` is the entire reason this works: without it the stream yields
+    only the root graph's updates and the sub-agents' threads are invisible — which
+    is exactly the blind spot `measure_context.py` has.
+    """
+    per_namespace: dict[tuple[str, ...], list[BaseMessage]] = defaultdict(list)
+    seen: set[int] = set()
+
+    for namespace, update in agent.stream(
+        {"messages": [{"role": "user", "content": question}]},
+        config={"recursion_limit": RECURSION_LIMIT},
+        subgraphs=True,
+        stream_mode="updates",
+    ):
+        for node_update in (update or {}).values():
+            if not isinstance(node_update, dict):
+                continue
+            for message in node_update.get("messages", []) or []:
+                # A message can be emitted by more than one node update; count each
+                # one once or every token figure here is inflated.
+                if id(message) not in seen:
+                    seen.add(id(message))
+                    per_namespace[namespace].append(message)
+
+    threads = [
+        _measure(_label_for(namespace, messages), messages)
+        for namespace, messages in per_namespace.items()
+    ]
+    # Orchestrator first, then sub-agents in the order they were invoked.
+    threads.sort(key=lambda t: (t.label != "orchestrator",))
+
+    root = per_namespace.get((), [])
+    answer = root[-1].text if root else ""
+    return threads, answer
+
+
+def report(threads: list[Thread]) -> None:
+    header = f"{'agent':<16}{'turns':>7}{'tool calls':>12}{'cumulative in':>16}{'peak in':>10}"
+    print(f"\n{header}")
+    print("-" * len(header))
+    for t in threads:
+        print(
+            f"{t.label:<16}{t.turns:>7}{t.tool_calls:>12}"
+            f"{t.cumulative_input_tokens:>16,}{t.peak_input_tokens:>10,}"
+        )
+    print("-" * len(header))
+
+    if not threads:
+        print("No usage metadata was returned — the provider reported no token counts.")
+        return
+
+    total_cumulative = sum(t.cumulative_input_tokens for t in threads)
+    print(
+        f"{'whole run':<16}{sum(t.turns for t in threads):>7}"
+        f"{sum(t.tool_calls for t in threads):>12}{total_cumulative:>16,}"
+        f"{max(t.peak_input_tokens for t in threads):>10,}"
+    )
+
+    subagents = [t for t in threads if t.label != "orchestrator"]
+    if not subagents:
+        print(
+            "\nNo sub-agent threads appeared. The orchestrator answered alone, which "
+            "means delegation did not happen — Phase 4's definition of done is not met."
+        )
+        return
+
+    widest = max(threads, key=lambda t: t.peak_input_tokens)
+    print(
+        f"\n{len(subagents)} sub-agent invocation(s), each in its own thread. The "
+        f"largest single context was {widest.peak_input_tokens:,} tokens, in "
+        f"{widest.label}."
+    )
+    quarantined = sum(t.cumulative_input_tokens for t in subagents)
+    print(
+        f"{quarantined:,} of the run's {total_cumulative:,} input tokens "
+        f"({quarantined / total_cumulative:.0%}) were carried in sub-agent threads and "
+        "never entered the orchestrator's. That is the quarantine, in tokens."
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("question", nargs="*", help="defaults to agent.EXAMPLE_QUESTION")
+    parser.add_argument(
+        "--answer",
+        action="store_true",
+        help="also print the guide the run produced",
+    )
+    args = parser.parse_args()
+
+    question = " ".join(args.question).strip() or EXAMPLE_QUESTION
+    print(f"Question: {question}")
+
+    threads, answer = run(question)
+    report(threads)
+
+    if args.answer:
+        print(f"\n{'=' * 70}\n{answer}")
+
+
+if __name__ == "__main__":
+    main()

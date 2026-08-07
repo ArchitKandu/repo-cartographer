@@ -4,6 +4,24 @@
     uv run scripts/measure_context.py --repeats 3
     uv run scripts/measure_context.py "Explore pallets/flask and explain routing."
 
+!!! Read this before quoting a number from here after Phase 4 !!!
+
+This script measures the *orchestrator's* thread, and only that. It reads
+`state["messages"]` off a finished run, which since Phase 4 contains the
+orchestrator's turns and nothing else — its sub-agents' threads never appear
+there.
+
+The explorer is now the only agent that reads files, so the arm this script calls
+"offload on" no longer exercises the mechanism it was written to measure: the
+orchestrator's own tool results are sub-agent reports, which are small, and its
+figures for both arms fell sharply at Phase 4 for a reason that is not a saving.
+The tokens moved somewhere this script cannot see.
+
+Kept as-is rather than retrofitted, because its Phase 3 numbers are a real result
+about a system that existed and are quoted in the README as such. For per-agent
+figures on the current three-agent system, use `scripts/show_contexts.py`, which
+streams with `subgraphs=True` and can therefore see all three threads.
+
 Two arms, one variable. Both use the same prompt, the same tools and the same
 workspace; they differ only in `tool_result_token_limit`. With it set, a tool
 result over the threshold is written to the workspace and replaced in the thread

@@ -23,8 +23,9 @@ reasoning behind the ordering.
 | 0 | Environment, packaging, config | Done |
 | 1 | GitHub tools layer + tests | Done — 21 tests, no mocking |
 | 2 | Bare agent (tools + prompt) | Done |
-| 3 | Filesystem backend | Done — this is what runs today |
-| 4+ | Sub-agents, evals, skills | Planned |
+| 3 | Filesystem backend | Done |
+| 4 | Explorer + doc-writer sub-agents | Done — this is what runs today |
+| 5+ | Evals, link-checker, skills | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
 tool before calling any of yours, unprompted"* — is met. On `psf/requests` with
@@ -70,11 +71,55 @@ it hasn't earned — when nothing crossed the eviction threshold it prints that
 fact rather than the difference, which is exactly what happened on the first repo
 tried, whose only large file was a lockfile the prompt tells the agent to skip.
 
-What works right now: a single agent with three GitHub tools, a planning tool, and
-a workspace it writes findings into. The "write a full onboarding guide" product
-is still ahead, and so is everything Phase 4 onward — no sub-agent, no eval set,
-no citation checking. Paths in the answer carry the prompt's instruction to cite
-only verified ones, not a guarantee; that guarantee is Phase 6's job.
+### Phase 4: three agents, three context windows
+
+The definition of done is a trace showing two or more sub-agent invocations, each
+in its own context window rather than one long growing thread.
+`scripts/show_contexts.py` reports the same split locally, by streaming with
+`subgraphs=True` — one run against `psf/requests`:
+
+```
+agent             turns  tool calls   cumulative in   peak in
+-------------------------------------------------------------
+orchestrator          8           7          35,314     6,113
+explorer              8          14         106,358    23,780
+doc-writer            3           2           6,276     3,196
+-------------------------------------------------------------
+whole run            19          23         147,948    23,780
+```
+
+76% of the run's input tokens were carried in sub-agent threads and never entered
+the orchestrator's. Its own peak context was 6,113 tokens while the explorer's was
+23,780 — that gap is the quarantine, and on one thread all of it would have been
+the same thread.
+
+**The total did not go down, and that is the honest headline.** Delegation adds
+turns: a brief to write, a report to relay, a guide to pass through. Three agents
+cost more in total than one did. What you buy is the peak and the isolation — the
+doc-writer composed that guide inside 3,196 tokens because all it ever saw was one
+notes file.
+
+Two things worth noticing in those numbers. The explorer's context is *larger*
+than anything Phase 3 measured, because it is the agent doing all the reading now
+— which is why Phase 3's eviction threshold is restated in its spec rather than
+left at the library default; three results were offloaded during that run. And
+`scripts/measure_context.py` can no longer see any of this: it reads a finished
+run's `state["messages"]`, which is the orchestrator's thread alone. Its numbers
+fell sharply at Phase 4 for a reason that is not a saving, and its docstring now
+says so.
+
+What works right now: an orchestrator that plans and delegates, an explorer that
+reads code and takes notes, and a doc-writer that turns those notes into a guide
+with an architecture overview, a where-things-happen table, and an explicit list
+of what went unread. Still ahead: the eval set (Phase 5), citation checking
+(Phase 6), skills (Phase 7). Paths in the guide carry three prompts' instruction
+to cite only verified ones, plus one structural guarantee — the doc-writer has no
+GitHub access, so it cannot describe a file nobody read. It can still repeat an
+explorer's mistake, and catching that is Phase 6's job.
+
+The good-first-issues section the project promises is deliberately absent: nothing
+here can read an issue tracker yet, so `DOC_WRITER_PROMPT` forbids inferring one
+from the code rather than letting the model invent it.
 
 ---
 
@@ -82,48 +127,95 @@ only verified ones, not a guarantee; that guarantee is Phase 6's job.
 
 ```mermaid
 flowchart LR
-    U([Your question]) --> A[Agent<br/>deepagents + LangGraph]
+    U([Your question]) --> A[Orchestrator<br/>plans, delegates, checks]
     A <--> M[["LLM<br/>Gemini or OpenRouter"]]
-    A --> P[write_todos<br/>plan the exploration]
-    A --> T{GitHub tools}
+    A --> P[write_todos]
+    A --> K{task}
+    K --> E[explorer<br/>own context window]
+    K --> C[doc-writer<br/>own context window]
+    E --> T{GitHub tools}
     T --> T1[get_repo_tree]
     T --> T2[get_file_contents]
     T --> T3[search_code]
     T1 & T2 & T3 --> G[(GitHub REST API)]
-    A --> W{Workspace tools}
-    W --> W1[write_file / edit_file]
-    W --> W2[read_file / ls]
-    W1 & W2 --> D[("./workspace<br/>notes.md")]
+    E -- write_file --> D[("./workspace<br/>notes/overview.md")]
+    D -- read_file --> C
+    A -- ls / read_file --> D
+    C -- the guide --> A
     A --> R([Answer])
 ```
 
-The agent loops: the model picks a tool, the tool calls GitHub, the result goes
-back into the model's context, repeat until it can answer. The three GitHub tools
-are plain Python functions — the library derives each tool's schema and
-description from its signature and docstring, so `tools.py` is the single source
-of truth for what the model knows about them.
+Three agents, one workspace. The orchestrator has no GitHub tools at all and
+cannot open a file; the explorer has all three and reads code; the doc-writer has
+neither and writes the guide from what the explorer left on disk. Each sub-agent
+runs in its own message thread, so a file the explorer reads never enters the
+orchestrator's context — only the explorer's short final report does.
 
-There are two namespaces here and keeping them apart is most of the prompt's job.
+Two channels carry work across those boundaries and there are no others: a
+sub-agent's final message, and files in the shared workspace. That constraint is
+the cost of isolation, and it is why the handoff conventions are stated in all
+three prompts rather than assumed.
+
+Each agent loops: the model picks a tool, the tool runs, the result goes back into
+that agent's context, repeat until it can answer. The three GitHub tools are plain
+Python functions — the library derives each tool's schema and description from its
+signature and docstring, so `tools.py` is the single source of truth for what the
+model knows about them.
+
+There are two namespaces here and keeping them apart is most of the prompts' job.
 GitHub is remote and read-only; the workspace is local, writable, and starts
-empty, so `read_file` reaches a repository file only after the agent has put one
-there. Eight tools reach the model, and both halves of that are deliberate:
+empty, so `read_file` reaches a repository file only after some agent has put one
+there. Every agent gets a deliberately narrow set:
+
+| | GitHub | workspace | other |
+|---|---|---|---|
+| orchestrator | — | `ls`, `read_file` | `task`, `write_todos` |
+| explorer | all three | `read_file`, `write_file` | — |
+| doc-writer | — | `ls`, `read_file` | — |
+
+Two mechanisms produce that table, and they are not interchangeable.
+[`middleware.py`](repo_cartographer/middleware.py) hides tools from the
+orchestrator per model request — the tool node still holds them, the model is just
+never told. Each sub-agent instead restates `FilesystemMiddleware(tools=[...])` in
+its own spec, which is stronger: an excluded tool is never constructed, so it
+cannot be dispatched at all. Sub-agents need their own because **a parent's
+middleware is not inherited by declarative sub-agents** — omit it and both
+delegates get `execute`, `glob`, `grep` and `delete` handed straight back.
+
+`tests/test_wiring.py` pins all of it, with no model involved:
+
+```console
+$ uv run pytest tests/test_wiring.py -q
+16 passed
+```
+
+Both halves of the table are deliberate:
 
 - **`write_todos` is added.** It comes from `TodoListMiddleware`, passed
   explicitly — as of deepagents 0.7.3 planning is *not* in the default middleware
   stack. Mapping a repo is several steps deep, so
   [`ORCHESTRATOR_PROMPT`](repo_cartographer/prompts.py) asks for a todo list before
   the first tool call, and the agent writes one.
-- **Five built-ins are taken away.** `create_deep_agent` also supplies `glob`,
-  `grep`, `delete`, a shell (`execute`) and a sub-agent spawner (`task`). Search
-  over a workspace holding one file the agent wrote itself tells it nothing;
-  `execute` has no sandbox backend to run in and only returns an error; `task` is
-  Phase 4's variable, kept out so Phase 3 measures one thing.
-  [`middleware.py`](repo_cartographer/middleware.py) hides them. This mattered
-  more at Phase 2, when the whole filesystem was hidden: the first model tried
-  here spent 8 of 16 tool calls on `read_file("src/foo.py") → not found` before
-  the workspace had any purpose, and removing the tools halved what a run cost.
-  The set shrinks by one entry per phase, as each phase finds a use for another
-  built-in.
+- **Six built-ins are taken away from the orchestrator.** `create_deep_agent` also
+  supplies `glob`, `grep`, `delete` and a shell (`execute`); none has anything to
+  do here, and `execute` has no sandbox backend so it only ever returns an error.
+  `write_file` and `edit_file` joined that list at Phase 4, when writing moved out
+  of the orchestrator — its explorer writes and its doc-writer reads, and it only
+  checks. There is a second reason beyond wasted turns: an orchestrator that can
+  edit its delegates' notes can quietly launder them.
+  This mattered most at Phase 2, when the whole filesystem was hidden: the first
+  model tried here spent 8 of 16 tool calls on `read_file("src/foo.py") → not
+  found` before the workspace had any purpose, and removing the tools halved what
+  a run cost.
+- **The default `general-purpose` sub-agent is switched off.** `create_deep_agent`
+  adds one to the `task` menu unless told otherwise, advertised to the model as
+  having "all tools as the main agent" — which, now that the orchestrator holds
+  none, means none. A delegate that can do nothing, described as the one that can
+  do anything. A `HarnessProfile` registered against the active model removes it;
+  the key is built in [`models.py`](repo_cartographer/models.py) because its shape
+  differs per provider, and a key that fails to match doesn't raise — it silently
+  leaves the default in place, which is why a test asserts the menu instead of
+  trusting the call.
 
 **Offloading.** `FilesystemMiddleware` watches every tool result and writes any
 one over `TOOL_RESULT_TOKEN_LIMIT` (2,000 tokens, well below the library's 20,000
@@ -367,15 +459,17 @@ print(get_file_contents("pallets", "flask", "pyproject.toml"))
 repo-cartographer/
 ├── repo_cartographer/
 │   ├── __init__.py      Package docstring; re-exports the GitHub tools
-│   ├── agent.py         build_agent(), map_repo(), ask() — the wiring
-│   ├── prompts.py       The instructions the agent works from
-│   ├── middleware.py    Hides the built-in tools this phase doesn't use
+│   ├── agent.py         build_agent(), build_subagents(), ask() — the wiring
+│   ├── prompts.py       The three prompts: orchestrator, explorer, doc-writer
+│   ├── middleware.py    Hides the built-ins the orchestrator doesn't use
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
 │   └── tools.py         GitHub API functions — no LLM code
 ├── scripts/
-│   └── measure_context.py   Phase 3's A/B: offloading on vs. off
+│   ├── measure_context.py   Phase 3's A/B: offloading on vs. off
+│   └── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
 ├── tests/
-│   └── test_tools.py    Live tests against the real GitHub API
+│   ├── test_tools.py    Live tests against the real GitHub API
+│   └── test_wiring.py   The three-way split, asserted without a model
 ├── workspace/           The agent's scratch space — git-ignored, run output
 ├── main.py              CLI: uv run main.py "your question"
 ├── .env.example         Template for your keys — copy to .env
@@ -384,9 +478,11 @@ repo-cartographer/
 └── uv.lock              Exact pinned versions
 ```
 
-`agent.py` holds the prompt because the prompt is still most of the agent: with
-no sub-agents and no skills yet, the orchestrator prompt and the three tool
-docstrings are nearly the whole specification of its behaviour.
+`prompts.py` exists because Phase 4 needed three prompts instead of one. The
+division is that `agent.py` is *wiring* — which model, which tools, which
+middleware, in what order — and `prompts.py` is *content*. Prompts and the three
+tool docstrings are still nearly the whole specification of behaviour; by Phase 7
+the ecosystem-specific parts move out again into `skills/`.
 
 `build_agent()` takes exactly one argument, `tool_result_token_limit`, and that
 is deliberate — it is the variable Phase 3 measures. Passing `None` disables
@@ -529,12 +625,18 @@ parameters). Measured on the same `psf/requests` ask, it:
 
 Multi-step tool use is where small models fall down first, and this task is
 nothing but multi-step tool use. The planning failure was fixed by moving to a
-capable-enough model. The wasted `read_file` calls were fixed at Phase 2 by
-hiding the workspace tools outright; Phase 3 gives them back, so what now keeps
-the model from repeating that mistake is the prompt drawing the line between a
-remote read-only repository and a local workspace that starts empty — a weaker
-guarantee than removal, and the reason the distinction is stated twice in
-[`ORCHESTRATOR_PROMPT`](repo_cartographer/prompts.py).
+capable-enough model. The wasted `read_file` calls were fixed at Phase 2 by hiding
+the workspace tools outright; Phase 3 gave them back, so what keeps the model from
+repeating that mistake is the prompts drawing the line between a remote read-only
+repository and a local workspace that starts empty — a weaker guarantee than
+removal, and the reason the distinction is stated twice in both
+[`ORCHESTRATOR_PROMPT` and `EXPLORER_PROMPT`](repo_cartographer/prompts.py).
+
+Phase 4 narrows the opening again from a different direction: the only agent that
+can reach GitHub now holds just `read_file` and `write_file` on the workspace, and
+the only agent that could confuse the two namespaces is the one whose prompt spends
+the most words on the distinction. The doc-writer, which has no GitHub tools at
+all, cannot make the mistake in either direction.
 
 ### If you stay on OpenRouter
 
