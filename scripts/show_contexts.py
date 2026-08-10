@@ -88,6 +88,7 @@ def _label_for(namespace: tuple[str, ...], messages: Iterable[BaseMessage]) -> s
     if not namespace:
         return "orchestrator"
 
+    messages = list(messages)
     called = {
         call.get("name")
         for message in messages
@@ -95,8 +96,15 @@ def _label_for(namespace: tuple[str, ...], messages: Iterable[BaseMessage]) -> s
     }
     if called & {"get_repo_tree", "get_file_contents", "search_code"}:
         return "explorer"
-    if called <= {"ls", "read_file"} and called:
+    if called <= {"ls", "read_file", "write_file"} and called:
         return "doc-writer"
+    # The link-checker calls no tools at all — it *is* the tool — so the signal
+    # every other branch here relies on is absent by construction. It is named
+    # from the one thing it does emit. Worth the special case: without it Phase
+    # 6's delegate shows up as an anonymous namespace, and a report that cannot
+    # name an agent cannot be used to check the agent ran.
+    if any(message.text.startswith("CITATION CHECK") for message in messages):
+        return "link-checker"
     return f"sub-agent {namespace[-1].split(':')[0]}"
 
 
@@ -234,6 +242,27 @@ def report(threads: list[Thread], dispatch: list[int]) -> None:
         f"({quarantined / total_cumulative:.0%}) were carried in sub-agent threads and "
         "never entered the orchestrator's. That is the quarantine, in tokens."
     )
+
+    # Phase 6, visible in the same table as everything else: one of the rows is a
+    # delegate that spent nothing, because it has no model to spend it with. A
+    # zero here is the claim "a sub-agent is a unit of delegated work, not a
+    # smaller model call" reported as a measurement rather than asserted in a
+    # doc — and its *absence* is the more useful signal, since it means the
+    # orchestrator skipped a step its prompt says is not optional.
+    checker = next((t for t in threads if t.label.startswith("link-checker")), None)
+    if checker is None:
+        print(
+            "\nNo link-checker thread appeared. The orchestrator handed over a guide "
+            "whose citations were never verified, which its prompt forbids — Phase 6's "
+            "delegate is wired in but was not used on this run."
+        )
+    else:
+        print(
+            f"\nThe link-checker ran and cost {checker.cumulative_input_tokens} input "
+            f"tokens over {checker.turns} model turn(s). It holds no model: the citation "
+            "check is arithmetic over the repository's file tree, delegated through the "
+            "same `task` tool as the agents that think."
+        )
 
     if not dispatch:
         return

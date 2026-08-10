@@ -1,4 +1,4 @@
-"""Repo Cartographer's agent — Phase 4: one orchestrator, two sub-agents.
+"""Repo Cartographer's agent — one orchestrator, three sub-agents.
 
 Phase 3 was one agent with a workspace. Phase 4 changes one thing: the work is
 split three ways. An `explorer` holds the reading tools and reads code; a
@@ -27,6 +27,15 @@ through exactly two channels — a sub-agent's final message, and files in the
 shared workspace — which is why the handoff conventions in `prompts.py` are
 stated from all three sides.
 
+Phase 6 added a third delegate, `link-checker`, and it is the one worth pausing
+on: it holds no model. It is a `CompiledStateGraph` wrapping the plain functions
+in `citations.py`, briefed through the same `task` tool and read back the same
+way as the other two. What it demonstrates is that a sub-agent is a unit of
+delegated work rather than a smaller model call — and what it *does* is the
+first defence in this system against a wrong citation that is arithmetic rather
+than instruction. The doc-writer now saves its guide to the workspace so there
+is a file for it to check.
+
 What lives here is the wiring — models, tools, middleware, and the order they go
 in. The instructions each agent works from are in `prompts.py`, and the model
 they reason with is in `models.py`, so neither is a reason to edit this file.
@@ -35,7 +44,7 @@ they reason with is in `models.py`, so neither is a reason to edit this file.
 from pathlib import Path
 from typing import Any
 
-from deepagents import SubAgent, create_deep_agent
+from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware import FilesystemMiddleware
@@ -47,6 +56,10 @@ from deepagents.profiles import (
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langgraph.graph.state import CompiledStateGraph
 
+from repo_cartographer.link_checker import (
+    LINK_CHECKER_DESCRIPTION,
+    build_link_checker,
+)
 from repo_cartographer.middleware import RestrictToolsMiddleware
 from repo_cartographer.models import MODEL_PROFILE_KEY, model
 from repo_cartographer.prompts import (
@@ -101,13 +114,21 @@ register_harness_profile(
 
 def build_subagents(
     backend: BackendProtocol, *, tool_result_token_limit: int | None
-) -> list[SubAgent]:
-    """The two delegates, as specs rather than compiled graphs.
+) -> list[SubAgent | CompiledSubAgent]:
+    """The three delegates, as specs rather than compiled graphs.
 
     Kept as a separate function, returning plain dicts, so the split can be
     checked without building an agent or spending a request: `tests/test_wiring.py`
     asserts against what this returns. That is the whole reason it is not inlined
     into `build_agent`.
+
+    Two of the three are `SubAgent` — a prompt, a model and some tools. The
+    third, added at Phase 6, is a `CompiledSubAgent`: a graph with no model in
+    it at all. The union in the return type is the phase's argument stated in
+    Python. The `task` tool builds its menu from this one list, briefs every
+    entry the same way and reads every entry's final message the same way, so
+    the orchestrator cannot tell from the outside which of its delegates thinks.
+    A sub-agent is a unit of delegated work, not a smaller model call.
 
     Two things here are easy to get wrong and silent when you do:
 
@@ -150,11 +171,18 @@ def build_subagents(
     doc_writer_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         FilesystemMiddleware(
             backend=backend,
-            # Read-only, and `ls` on purpose: the orchestrator's brief lists the
-            # notes paths, but a brief is a claim. Listing the directory is how the
-            # doc-writer learns an explorer died half way, instead of writing a
-            # guide around a file that is not there.
-            tools=["ls", "read_file"],
+            # `ls` on purpose: the orchestrator's brief lists the notes paths,
+            # but a brief is a claim. Listing the directory is how the doc-writer
+            # learns an explorer died half way, instead of writing a guide around
+            # a file that is not there.
+            #
+            # `write_file` arrived at Phase 6 and is the one tool this agent
+            # gained since it was created. It does not weaken the blindfold —
+            # the workspace is not GitHub, and the doc-writer still has no way to
+            # read a line of the repository — but it is what makes the guide a
+            # file on disk rather than only a message in a thread, and a file is
+            # the only thing a non-model checker can be pointed at.
+            tools=["ls", "read_file", "write_file"],
         ),
     ]
 
@@ -177,10 +205,11 @@ def build_subagents(
         {
             "name": "doc-writer",
             "description": (
-                "Writes the onboarding guide from notes already in the workspace, "
-                "and returns it as its final message. Has no repository access, so "
-                "anything it should mention must already be in the notes. Brief it "
-                "with the question and the exact notes paths."
+                "Writes the onboarding guide from notes already in the workspace. "
+                "Saves it to the workspace path you name and also returns it as "
+                "its final message. Has no repository access, so anything it "
+                "should mention must already be in the notes. Brief it with the "
+                "question, the exact notes paths, and where to save the guide."
             ),
             "system_prompt": DOC_WRITER_PROMPT,
             # Not an oversight, and not inheritance — the guarantee the whole
@@ -188,6 +217,17 @@ def build_subagents(
             # nobody read.
             "tools": [],
             "middleware": doc_writer_middleware,
+        },
+        {
+            "name": "link-checker",
+            "description": LINK_CHECKER_DESCRIPTION,
+            # `runnable` instead of `system_prompt`/`tools`, and that difference
+            # is the whole of Phase 6. This delegate holds no model: it is a
+            # one-node graph running the plain functions in `citations.py`
+            # against the repository's real file tree. See `link_checker.py` for
+            # why the least intelligent agent here is the only one that cannot be
+            # talked out of its job.
+            "runnable": build_link_checker(backend),
         },
     ]
 

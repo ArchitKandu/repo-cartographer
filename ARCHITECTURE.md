@@ -4,16 +4,17 @@ How Repo Cartographer works, why it is built this way, and what one real run
 looks like from start to finish.
 
 This document assumes no prior knowledge of the codebase. If you want the short
-version: **one AI agent was split into four, so that no single one has to hold an
-entire repository in its head.** Everything below is the detail of that sentence.
+version: **one AI agent was split into several, so that no single one has to
+hold an entire repository in its head — and the last one added holds no AI at
+all.** Everything below is the detail of that sentence.
 
 - [What the project does](#what-the-project-does)
 - [The problem it is built around](#the-problem-it-is-built-around)
-- [The four agents](#the-four-agents)
+- [The agents](#the-agents)
 - [The files, and how they connect](#the-files-and-how-they-connect)
 - [A real run, step by step](#a-real-run-step-by-step)
 - [The handoff contract](#the-handoff-contract)
-- [Ten decisions that are the architecture](#ten-decisions-that-are-the-architecture)
+- [Eleven decisions that are the architecture](#eleven-decisions-that-are-the-architecture)
 - [What it costs](#what-it-costs)
 - [Failure modes we have actually seen](#failure-modes-we-have-actually-seen)
 - [How to verify any of this](#how-to-verify-any-of-this)
@@ -74,10 +75,11 @@ agents that do the reading.
 
 ---
 
-## The four agents
+## The agents
 
-Each agent runs its own separate conversation with the model. They cannot see each
-other's conversations.
+Each agent runs its own separate conversation with the model — except the last
+one, which runs no conversation at all, and that is the point of it. They cannot
+see each other's contexts.
 
 ```mermaid
 flowchart TB
@@ -96,18 +98,46 @@ flowchart TB
 
     W -->|read_file| D["<b>DOC-WRITER</b> — the writer<br/>own conversation<br/><br/><b>cannot reach GitHub at all</b><br/>blindfolded on purpose"]
 
+    D -->|write_file /guide.md| W
     D -->|the finished guide| O
+
+    O -->|"task(link-checker)"| L["<b>LINK-CHECKER</b> — the auditor<br/><b>no model. plain Python.</b><br/><br/>reads /guide.md, reads the real tree,<br/>reports every path that does not exist"]
+    W -->|reads the guide| L
+    L --> GH
+    L -->|verdict| O
+
     O --> A([your answer])
 ```
 
-| Agent | Can reach GitHub? | Can write? | Job |
-|---|---|---|---|
-| **orchestrator** | shape only — folder names and file counts | no | Decide how to divide the repo, brief the others, verify their output, relay the guide |
-| **explorer** (up to 3) | yes — tree, file contents, code search | yes, its own notes file | Read one top-level directory and write down what is in it |
-| **doc-writer** | **no** | no | Turn the notes into the guide |
+| Agent | Can reach GitHub? | Can write? | Model? | Job |
+|---|---|---|---|---|
+| **orchestrator** | shape only — folder names and file counts | no | yes | Decide how to divide the repo, brief the others, verify their output, relay the guide |
+| **explorer** (up to 3) | yes — tree, file contents, code search | yes, its own notes file | yes | Read one top-level directory and write down what is in it |
+| **doc-writer** | **no** | yes, the guide | yes | Turn the notes into the guide |
+| **link-checker** | the file tree only | no | **no** | Verify every path the guide cites actually exists |
 
 The asymmetry is the design. Read on for why each blank in that table is
 deliberate.
+
+### Why one delegate has no model in it
+
+The `link-checker` is a `CompiledStateGraph` with one node that runs ordinary
+Python. It appears in the same `task` menu as the other two, is briefed the same
+way, and returns a final message the same way. The orchestrator cannot tell from
+the outside that nothing thought.
+
+That is worth building for two separate reasons.
+
+**It is what a sub-agent actually is.** Not a smaller model call — a unit of
+delegated work. Nothing on the orchestrator's side of the handoff changes when
+the thing on the other end stops being a language model, and a system where that
+is true can delegate to whatever does the job best.
+
+**"Does this path exist" should never be an opinion.** It is decidable from the
+file tree Phase 1 already returns. Asking a model would cost a request, take
+seconds, and be wrong occasionally in a way nothing downstream could detect. The
+least intelligent agent here is the only one that cannot be talked out of its
+job.
 
 ### Why the doc-writer is blindfolded
 
@@ -157,39 +187,47 @@ actually *says* has to come back from an explorer.
 ## The files, and how they connect
 
 ```
-   tools.py         models.py        prompts.py       middleware.py
-   ─────────        ─────────        ──────────       ─────────────
-   4 functions      the model        3 job            hides tools
-   over GitHub      + request        descriptions     from the
-   REST API         queue            (plain strings)  orchestrator
-       │                │                 │                │
-       └────────────────┴────────┬────────┴────────────────┘
-                                 ▼
-                            agent.py
-                    the org chart — the ONLY file
-                   that imports the other four
-                                 │
-      ┌───────────────┬──────────┴──────────┬────────────────────┐
-      ▼               ▼                     ▼                    ▼
-   main.py     show_contexts.py       run_evals.py        test_wiring.py
-    (CLI)      (measures a run)       (scores six)     (asserts the org chart)
-
-   __init__.py ───────► tools.py only, never agent.py
-   tests/test_tools.py ► tools.py only
-   tests/test_evals.py ► tools.py + tests/evals/, never agent.py
+   tools.py        models.py      prompts.py    middleware.py   citations.py
+   ─────────       ─────────      ──────────    ─────────────   ────────────
+   4 functions     the model      3 job         hides tools     does this path
+   over GitHub     + request      descriptions  from the        exist? no AI,
+   REST API        queue          (strings)     orchestrator    no agent code
+       │               │              │              │            │      ▲
+       │               │              │              │            │      │
+       ├───────────────┴──────────────┴──────────────┴────────────┘      │
+       │                             ▼                                   │
+       │                        agent.py                        link_checker.py
+       │                the org chart — the ONLY file      the graph wrapper: brief
+       │               that imports all the others  ◄───   in, verdict out, 1 node
+       │                             │
+       │    ┌──────────┬─────────────┼─────────────┬──────────────────┐
+       │    ▼          ▼             ▼             ▼                  ▼
+       │ main.py  show_contexts  run_evals  prove_link_checker   test_wiring
+       │  (CLI)   (per-agent)    (scores 6)  (the phase-6 proof) (the org chart)
+       │
+       └──► __init__.py, tests/test_tools.py, tests/test_evals.py — tools only,
+            never agent.py
 ```
 
-**The shape is the point.** The four modules on the top row import *nothing* from
-this project. That makes each one independently testable and independently
-replaceable — swap the model, and you touch one file; reword a prompt, one file.
-`agent.py` is the single place where they are composed into a working system.
+**The shape is the point.** The five modules on the top row import *nothing* from
+this project except each other's leaves. That makes each one independently
+testable and independently replaceable — swap the model, and you touch one file;
+reword a prompt, one file. `agent.py` is the single place where they are composed
+into a working system.
+
+Note where `citations.py` sits: alongside `tools.py`, not underneath `agent.py`.
+Both are the same kind of thing — plain functions with no AI in them — and both
+are testable with a list of strings. `link_checker.py` is only the adapter that
+lets a graph call one.
 
 | File | What lives there | Why it is separate |
 |---|---|---|
 | `tools.py` | `get_repo_tree`, `get_file_contents`, `search_code`, `get_repo_scopes` | The one deterministic layer. No AI code at all, so it can be tested for real against GitHub — 26 live tests, zero mocking |
 | `models.py` | Which model, which provider, and the shared request queue | Changing models should never mean editing the agent |
-| `prompts.py` | `ORCHESTRATOR_PROMPT`, `EXPLORER_PROMPT`, `DOC_WRITER_PROMPT` | Content, not wiring. Three prompts inline would bury the 20-line graph definition they surround |
+| `prompts.py` | `ORCHESTRATOR_PROMPT`, `EXPLORER_PROMPT`, `DOC_WRITER_PROMPT` | Content, not wiring. Three prompts inline would bury the 20-line graph definition they surround. Three prompts, four agents — the link-checker has no model to instruct |
 | `middleware.py` | `RestrictToolsMiddleware` | Hides built-in tools from the orchestrator per model request |
+| `citations.py` | `check_citations`, `cited_paths` | The second deterministic layer. Decides whether a cited path exists, with no model and no agent code, so the verdict is a fact. Testable with a list of strings |
+| `link_checker.py` | `build_link_checker`, `parse_brief` | The graph around `citations.py`: parse a brief, read the guide, return a verdict. Separate so the part that decides anything needs no graph to test |
 | `agent.py` | `build_subagents()`, `build_agent()`, `ask()` | The org chart: who reports to whom, who gets which tools |
 | `__init__.py` | Re-exports the GitHub tools **and deliberately not `agent`** | Importing `agent` builds a model and needs an API key; re-exporting it would make `import repo_cartographer` fail with no key configured, including during test collection |
 
@@ -304,8 +342,8 @@ ls /notes  →  ["root.md", "src.md"]
 ```
 
 Cheap, and it catches something real: an explorer can *report* success while its
-file is missing or somewhere useless. Checking beats trusting, and this is a
-miniature preview of Phase 6's link-checker.
+file is missing or somewhere useless. Checking beats trusting — the same instinct
+the link-checker in step 7 makes mechanical.
 
 ### Step 6 · the doc-writer composes
 
@@ -313,16 +351,39 @@ miniature preview of Phase 6's link-checker.
 ls /notes                    (don't trust the brief's list — verify it)
 read_file /notes/src.md
 read_file /notes/root.md
-→ returns the finished guide as its final message
+write_file /guide.md         (the artefact the checker will read)
+→ then returns the same guide as its final message
 ```
 
-It has two tools, both read-only, both pointed at a folder it did not write. It
-writes no file: its final message *is* the guide, generated once. Producing it and
-also saving it would mean generating the same text twice.
+Three tools, all pointed at a folder whose repository half it cannot see. It emits
+the guide twice — once into `/guide.md`, once as its report — and that redundancy
+is deliberate rather than sloppy: a checker that is a plain function cannot read a
+message inside someone else's conversation, and having the orchestrator read the
+file back instead would not work either, because `read_file` returns text with a
+line-number gutter down the side that "relay it verbatim" cannot survive.
 
-### Step 7 · the orchestrator relays it verbatim
+### Step 7 · the link-checker audits the citations
 
-The orchestrator repeats the doc-writer's message as its own, unedited, and stops.
+```
+task(link-checker, "owner=psf repo=requests guide=/guide.md")
+  → CITATION CHECK — psf/requests
+    7 file path(s) cited · 7 verified against the real repository tree · 0 not found
+```
+
+No model request. One node, running `citations.py` against the tree
+`get_repo_tree` returns — the same function the explorers read with, so the two
+cannot disagree about what the repository contains. On a guide carrying an
+invented path it comes back instead with:
+
+```
+NOT FOUND — these paths do not exist in psf/requests:
+  - src/requests/router.py
+```
+
+### Step 8 · the orchestrator relays it verbatim
+
+The orchestrator repeats the doc-writer's message as its own, unedited, and stops —
+prefixing a citation warning naming any flagged path, and otherwise adding nothing.
 `ask()` returns that last message. The guide comes back shaped like this:
 
 ```markdown
@@ -361,27 +422,38 @@ agents, and there are no others:
 ├── notes/
 │   ├── src.md                ← explorer #1 writes, doc-writer reads
 │   └── root.md               ← explorer #2 writes, doc-writer reads
+├── guide.md                  ← doc-writer writes, link-checker reads
 └── large_tool_results/       ← offloading stashes oversized tool results here
     └── aBqjVMEE
 ```
 
-Three conventions hold this together, and **none of them is enforced by code** —
-which is why all three prompts state them:
+`guide.md` is the newer of the two handoffs and the more interesting one, because
+the agent on the receiving end is a plain function. A file is the only channel a
+plain function can reach: it cannot be handed a message from someone else's
+conversation. So the workspace is not merely a way to keep tokens out of a thread
+— it is what makes a non-model delegate possible at all.
+
+Four conventions hold this together, and **none of them is enforced by code** —
+which is why the prompts state them:
 
 | Convention | What breaks without it |
 |---|---|
 | The orchestrator names the notes path; the explorer writes exactly there | The doc-writer looks somewhere the file is not |
 | Every explorer gets a **different** path | Saving replaces a file, so the second explorer to finish erases the first |
 | Paths start with `/` and never contain `workspace` | The write succeeds into a folder *inside* the workspace that nobody reads |
+| The doc-writer saves to `/guide.md`; the orchestrator briefs the checker with that same path | The checker finds no guide — and a check with nothing to check must never read as a clean one |
 
-That last one is not hypothetical — see [failure modes](#failure-modes-we-have-actually-seen).
+The third is not hypothetical — see
+[failure modes](#failure-modes-we-have-actually-seen) — and the fourth is pinned
+by `tests/test_wiring.py`, which asserts that both prompts and
+`link_checker.py`'s fallback still name the same path.
 
 ---
 
-## Ten decisions that are the architecture
+## Eleven decisions that are the architecture
 
-Everything above reduces to about ten lines of code. Each one is here because the
-obvious alternative fails in a specific way.
+Everything above reduces to about eleven lines of code. Each one is here because
+the obvious alternative fails in a specific way.
 
 **In `agent.py`:**
 
@@ -394,14 +466,15 @@ obvious alternative fails in a specific way.
 | 5 | `tool_token_limit_before_evict=…` restated on the explorer | Sub-agents default to the library's 20,000. The explorer is the only agent reading files now, so without this the tuned 2,000 sits on the agents that don't need it |
 | 6 | `RestrictToolsMiddleware()` **last** in the middleware list | It must run *after* the middleware that inject tools, or there is nothing to remove |
 | 7 | `register_harness_profile(…enabled=False)` | Deletes the library's default `general-purpose` sub-agent, which is advertised as having "all tools as the main agent" — now meaning *none* |
+| 8 | `"runnable": build_link_checker(backend)` instead of a prompt and tools | The one delegate with no model. Give it a system prompt "for flexibility" and a check that was arithmetic becomes an opinion — still shaped like a verdict, occasionally wrong, undetectably |
 
 **In `models.py`:**
 
 | # | Code | Why |
 |---|---|---|
-| 8 | `rate_limiter=…` on the **single** model instance | Sub-agents inherit the instance, so all four agents draw from one bucket. The provider's limit is per project, not per agent — four private limiters would spend four times the budget |
-| 9 | `ChatGoogleGenerativeAI`, not the OpenAI-compatible endpoint | Gemini 3 models emit an encrypted `thought_signature` with every tool call that must be sent back verbatim. The compatibility layer drops it and turn 2 of any tool loop fails |
-| 10 | `ask()` returns `.text`, not `.content` | Gemini fills `content` with typed blocks; printing it dumps a data structure instead of prose. `.text` works for both providers |
+| 9 | `rate_limiter=…` on the **single** model instance | Sub-agents inherit the instance, so every agent that thinks draws from one bucket. The provider's limit is per project, not per agent — private limiters would spend the budget several times over |
+| 10 | `ChatGoogleGenerativeAI`, not the OpenAI-compatible endpoint | Gemini 3 models emit an encrypted `thought_signature` with every tool call that must be sent back verbatim. The compatibility layer drops it and turn 2 of any tool loop fails |
+| 11 | `ask()` returns `.text`, not `.content` | Gemini fills `content` with typed blocks; printing it dumps a data structure instead of prose. `.text` works for both providers |
 
 ---
 
@@ -500,7 +573,22 @@ four cases, unchanged, on the retry: 5/5, 3/5, 5/5, 6/6.
 The point is not the bug. It is that the bug survived every phase in which
 verification meant watching a run, and died in the first sweep of a fixed set.
 
-**4 · A test that could never have passed.** While writing the check that the
+**4 · A verdict that shouted "NOT FOUND" when nothing was.** The citation
+checker's summary line read `… · 0 NOT FOUND` on a perfectly clean guide. The
+orchestrator is told to raise a warning when it sees that phrase, so a check that
+had just confirmed every path would have handed the guide over with an alarm
+attached to it. Caught by the test that asserts a clean verdict is readable as
+clean, which existed only because "the orchestrator acts on this text" made the
+wording part of the contract rather than decoration.
+
+**5 · A repository called `requests.`** The link-checker parses its brief out of
+prose, and "check psf/requests." yielded a repository whose name ended in the
+sentence's full stop. GitHub answers 404 for that — and a 404 here is not a small
+error, because every path in a perfectly good guide would come back missing and
+the whole document would be condemned. Names are now trimmed at the ends only,
+since dots are legal inside a repository name.
+
+**6 · A test that could never have passed.** While writing the check that the
 default `general-purpose` sub-agent was gone, the obvious assertion was *"the word
 `general-purpose` does not appear in the tool description."* It failed — because
 the description's fixed usage notes mention that name whether the agent is enabled
@@ -513,9 +601,11 @@ forever while checking nothing.
 ## How to verify any of this
 
 ```console
-$ uv run pytest tests/test_wiring.py -q      # 16 tests · ~1s · ZERO AI calls
+$ uv run pytest tests/test_wiring.py -q      # 18 tests · ~1s · ZERO AI calls
+$ uv run pytest tests/test_citations.py -q   # 24 tests · does the checker catch a fake path?
 $ uv run pytest tests/test_tools.py -q       # 26 tests · live GitHub, no mocking
 $ uv run pytest tests/test_evals.py -q       # 37 tests · is the eval set itself true?
+$ uv run scripts/prove_link_checker.py       # the phase-6 proof, with a real doc-writer
 $ uv run scripts/show_contexts.py            # one real run, per-agent tokens
 $ uv run scripts/run_evals.py                # six repos, one score
 $ uv run scripts/run_evals.py --score-only   # re-score recorded runs, free
@@ -561,11 +651,20 @@ total                                  31       29
 29 of 31 expected facts present (94%)
 ```
 
-The two misses are readable rather than mysterious: mapping `pallets/click`, the
-explorers covered `core.py` and `decorators.py` and never opened `types.py` or
-`parser.py`, so the guide could not mention them. That is the scope-coverage
-question the [known limitations](#known-limitations) could previously only
-describe anecdotally, now attached to a number that moves.
+The misses, when there are misses, are readable rather than mysterious: on the
+sweep this table comes from, mapping `pallets/click` covered `core.py` and
+`decorators.py` and never opened `types.py` or `parser.py`, so the guide could not
+mention them. That is the scope-coverage question the
+[known limitations](#known-limitations) could previously only describe
+anecdotally, now attached to a number that moves.
+
+**Phase 6 is the first change this refereed**, which is what the phase ordering
+was for. Adding the link-checker touched two prompts, added a delegate and a step,
+and gave the doc-writer a tool it had never had; the sweep afterwards came back
+31 of 31, against 29 before. The honest reading is *no regression* — not
+*improvement*. The two facts that moved were the `click` files nobody had opened,
+a coverage decision the model makes afresh every run, and one sample per case
+cannot tell that apart from a real effect.
 
 The dataset is `tests/evals/known_repos.jsonl` — six cases, thirty-one facts, each
 fact either a repo-relative **path** or a **term** that really occurs in a named
@@ -617,6 +716,32 @@ Notice the first explorer took 70.7s while overlapping for only 35.5s of it. Mos
 that remainder was spent waiting on the shared request queue, which is the rate limit
 made visible.
 
+### The delegate that cost nothing
+
+The same trace data settles Phase 6's claim, and it settles it in the one place the
+orchestrator's own transcript cannot: whether the check *happened*, on every run,
+and what it cost. Across the six-repository eval sweep:
+
+```
+                runs   tokens            avg duration
+explorer          48   6,783 – 440,016        94.77s
+doc-writer        20   7,075 –  30,185        24.89s
+link-checker      16       0 –       0         4.02s
+```
+
+Six of those link-checker runs are nested inside a `repo_cartographer` root run —
+one per mapping, so the orchestrator dispatched it every single time — and the rest
+are the direct invocations from the tests and `prove_link_checker.py`.
+
+**The zero is the phase.** A delegate briefed through the same `task` tool, nested
+in the trace beside the two that think, returning a final message its caller reads
+the same way — and spending nothing, because there is nothing in it to spend.
+
+Most of those runs finish in about half a second. One took 32.67s, which is worth
+not hiding: that is `get_repo_tree` against a slow connection, and it is the only
+cost this delegate has — one GitHub request, on the same retrying path everything
+else uses.
+
 ---
 
 ## Known limitations
@@ -658,10 +783,30 @@ reason, which contains the problem for the eval and not for anyone typing two
 `main.py` commands in a row. A per-run workspace is the actual fix and has not
 been made.
 
-**The guide can still repeat an explorer's mistake.** The doc-writer cannot invent a
-path, but it will faithfully reproduce a wrong one. Verifying cited paths against
-the real tree is Phase 6's job — a deliberately non-AI sub-agent that checks every
-path the guide cites.
+**The citation check has two deliberate blind spots.** It catches what it was
+built to catch — a path with a slash and a recognised file extension that is not
+in the tree, which is what the where-things-happen table is made of — and it
+declines to accuse two things:
+
+- **An invented directory.** `src/flask/nonexistent/` has no extension, and the
+  extension rule is what stops the checker calling "the `req`/`res` pair" a
+  fabrication.
+- **An invented root-level filename.** `setup.py` on its own has no slash, and the
+  slash rule is what stops it calling `flask.json` — a real module reference whose
+  last component is a real file extension — a lie.
+
+Both are the less damaging error, since neither promises a specific place to open.
+Both were bought on purpose: a safety net that raises false alarms gets switched
+off, and a checker that confidently condemns a correct guide is worse than no
+checker. The counts are reported either way, so the check's own margin of error is
+visible rather than implied.
+
+**The check reports; it does not repair.** When a path is flagged, the orchestrator
+prefixes a warning and hands over the guide unchanged. Deleting the offending line
+would produce a clean-looking document nobody can verify, and the orchestrator
+cannot know what the right path was — it has never read the repository. A reader
+told which lines to distrust is better served than one handed something silently
+tidied.
 
 **No good-first-issues section**, though the project promises one. Nothing here can
 read an issue tracker yet, so the prompt forbids inferring issues from code rather
@@ -691,7 +836,7 @@ credited with the change it caused. See
 | 4a | Context quarantine | Done |
 | 4b | Parallel fan-out | Done — trace verified |
 | 5 | Measurable regressions (eval set) | Done |
-| 6 | Sub-agents ≠ smaller AI calls (link-checker) | Next |
-| 7 | Prompt decomposition (skills) | Planned |
+| 6 | Sub-agents ≠ smaller AI calls (link-checker) | Done |
+| 7 | Prompt decomposition (skills) | Next |
 | 8 | Approval gates | Planned |
 | 9 | Packaging | Planned |

@@ -11,8 +11,9 @@ Built on [deepagents](https://pypi.org/project/deepagents/) (a LangGraph agent
 harness) with a small, deliberately boring GitHub tools layer underneath.
 
 **New here?** [ARCHITECTURE.md](ARCHITECTURE.md) explains the whole system from
-scratch — the four agents, how the files connect, and one real run traced step by
-step, with no prior knowledge of the codebase assumed.
+scratch — the agents (one of which contains no AI at all), how the files connect,
+and one real run traced step by step, with no prior knowledge of the codebase
+assumed.
 
 ---
 
@@ -31,7 +32,8 @@ reasoning behind the ordering.
 | 4a | Explorer + doc-writer sub-agents | Done |
 | 4b | Parallel fan-out per directory | **Done — trace verified, this is what runs today** |
 | 5 | Eval set: six repos, one score | Done |
-| 6+ | Link-checker, skills, approval gates | Planned |
+| 6 | Link-checker: a sub-agent with no model in it | Done |
+| 7+ | Skills, approval gates, packaging | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
 tool before calling any of yours, unprompted"* — is met. On `psf/requests` with
@@ -273,15 +275,135 @@ A bug that survives four phases of watching runs and dies in the first sweep of 
 fixed set is the argument for the phase, made better than any claim about it
 would have been.
 
+### Phase 6: the delegate with no model in it
+
+The worst thing this project can do is cite a file that does not exist. A reader
+trusts the path, opens their editor, finds nothing — and the guide was more useful
+before that sentence than after it.
+
+Five phases attacked that with instructions. Three prompts say *cite only what you
+verified*; Phase 4 added the one structural guarantee, that the doc-writer holds no
+GitHub tools and so cannot invent a path it never read. Neither stops it faithfully
+repeating an explorer's mistake.
+
+Phase 6 adds a third delegate that closes the gap, and the interesting thing about
+it is what it is not:
+
+```python
+{
+    "name": "link-checker",
+    "description": LINK_CHECKER_DESCRIPTION,
+    "runnable": build_link_checker(backend),   # not system_prompt, not tools
+}
+```
+
+No model. A `CompiledStateGraph` with one node running plain Python: read the guide
+the doc-writer saved, read the repository's real file tree, report every cited path
+that is not in it. It sits in the same `task` menu as the explorer and the
+doc-writer, is briefed the same way, and returns a final message the same way — the
+orchestrator cannot tell from the outside that nothing thought.
+
+That is the phase's argument. **A sub-agent is a unit of delegated work, not a
+smaller model call.** And "does this path exist" is decidable from a file tree, so
+asking a model would cost a request, take seconds, and be wrong occasionally in a
+way nothing downstream could detect. The least intelligent agent in the system is
+the only one that cannot be talked out of its job.
+
+**The definition of done — feed the doc-writer a fake path and confirm it gets
+flagged — is a script.** It plants notes about `psf/requests` that are accurate
+except for one invented `src/requests/router.py`, runs the real doc-writer over
+them, and runs the real checker over what it produced:
+
+```console
+$ uv run scripts/prove_link_checker.py
+
+1. running the real doc-writer over the poisoned notes …
+   guide returned: 2544 chars
+   guide on disk:  yes
+
+2. did the doc-writer repeat the fake path?
+   YES — it cites src/requests/router.py, exactly as an explorer's mistake would carry.
+
+3. running the real link-checker over the guide it wrote …
+
+   │ CITATION CHECK — psf/requests
+   │ 7 file path(s) cited · 6 verified against the real repository tree · 1 NOT FOUND
+   │
+   │ NOT FOUND — these paths do not exist in psf/requests:
+   │   - src/requests/router.py
+
+PASS — src/requests/router.py was flagged before a human ever saw the guide,
+by a delegate that made no model call to do it.
+```
+
+`tests/test_citations.py` asserts the same thing in milliseconds with no model and
+no network at all — which is the other thing a non-AI delegate buys you: its
+definition of done is a unit test rather than a run you hope to be watching.
+
+**The trace confirms it costs nothing, on every run.** Across the six-repository
+eval sweep, LangSmith recorded:
+
+```
+                runs   tokens            avg duration
+explorer          48   6,783 – 440,016        94.77s
+doc-writer        20   7,075 –  30,185        24.89s
+link-checker      16       0 –       0         4.02s
+```
+
+Six of those link-checker runs are nested inside a `repo_cartographer` root run —
+one per mapping, so the orchestrator really did dispatch it every time, which is
+the part no local report can establish. The rest are the direct invocations from
+the tests and the proof script. **The zero is the phase**: a delegate that sits in
+the same trace beside the two that think, briefed the same way, read back the same
+way, and spending nothing because there is nothing in it to spend.
+
+**Not crying wolf is half the work.** A guide is markdown a language model wrote,
+and it is full of things shaped like paths that are not claims about files: "the
+`req`/`res` pair", "sync/async", `Session.request()`, the repository's own name
+`psf/requests`, `flask.json` as a module reference. A path is only ever *accused*
+if it contains a slash and ends in a recognised file extension. Both conditions
+were bought with a specific false positive in mind, each has its own test, and the
+price is two named blind spots — an invented directory and an invented root-level
+filename go uncaught. A safety net that raises false alarms gets switched off; one
+that condemns a correct guide is worse than none.
+
+**And it reports rather than repairs.** When a path is flagged the orchestrator
+prefixes a warning naming it and hands the guide over unchanged. Deleting the line
+would produce a clean-looking document nobody can verify, and the orchestrator has
+never read the repository, so it cannot know what the right path was.
+
+#### This is the first change Phase 5 got to referee
+
+Phase 6 touched two prompts, added a delegate and a step, and gave the doc-writer a
+tool it never had. Before the eval set, the only way to ask *did any of that break
+the guides?* was to read a few and form an impression. Now:
+
+```console
+$ uv run scripts/run_evals.py
+
+requests  5/5 · flask 5/5 · click 5/5 · httpx 5/5 · express 6/6 · chalk 5/5
+
+31 of 31 expected facts present (100%)
+```
+
+Against 29 of 31 before the change — so: no regression, which is the claim worth
+making. The two facts that moved were `pallets/click`'s `types.py` and `parser.py`,
+which nobody had opened last time and someone did this time. That is a coverage
+decision the model makes afresh on every run, and Phase 5's own warning applies to
+it: **a two-point move on one sample per case is sampling, not causation.** Runs did
+get measurably slower — 249s against 214s on `psf/requests` — which is the honest
+cost of an extra delegate and a guide emitted twice.
+
 What works right now: an orchestrator that sizes a repository up and splits it
 across up to three explorers, explorers that read one directory each and take
 notes, and a doc-writer that turns those notes into a guide
 with an architecture overview, a where-things-happen table, and an explicit list
-of what went unread. Still ahead: citation checking (Phase 6), skills (Phase 7).
-Paths in the guide carry three prompts' instruction
-to cite only verified ones, plus one structural guarantee — the doc-writer has no
-GitHub access, so it cannot describe a file nobody read. It can still repeat an
-explorer's mistake, and catching that is Phase 6's job.
+of what went unread. Still ahead: skills (Phase 7), approval gates (Phase 8).
+Paths in the guide carry three prompts' instruction to cite only verified ones,
+one structural guarantee — the doc-writer has no GitHub access, so it cannot
+describe a file nobody read — and, since Phase 6, one arithmetic check: every
+cited path is matched against the repository's real file tree before the guide is
+handed over.
 
 The good-first-issues section the project promises is deliberately absent: nothing
 here can read an issue tracker yet, so `DOC_WRITER_PROMPT` forbids inferring one
@@ -300,19 +422,24 @@ flowchart LR
     A --> K{task}
     K --> E[explorer × up to 3<br/>one per top-level dir<br/>own context window each]
     K --> C[doc-writer<br/>own context window]
+    K --> L[link-checker<br/><b>no model — plain Python</b>]
     E --> T{GitHub tools}
     T --> T1[get_repo_tree]
     T --> T2[get_file_contents]
     T --> T3[search_code]
     T1 & T2 & T3 --> G[(GitHub REST API)]
-    E -- write_file --> D[("./workspace<br/>notes/src.md, notes/root.md")]
+    L --> T1
+    E -- write_file --> D[("./workspace<br/>notes/*.md · guide.md")]
     D -- read_file --> C
+    C -- write_file guide.md --> D
+    D -- reads guide.md --> L
     A -- ls / read_file --> D
     C -- the guide --> A
+    L -- citation verdict --> A
     A --> R([Answer])
 ```
 
-Up to five agents, one workspace. The orchestrator can learn a repository's
+Up to six agents, one workspace. The orchestrator can learn a repository's
 *shape* and nothing else — `get_repo_scopes` returns directory names and file
 counts in one request, which is enough to divide the work and not enough to
 describe the code. Each explorer reads one top-level directory and writes its own
@@ -341,7 +468,8 @@ there. Every agent gets a deliberately narrow set:
 |---|---|---|---|
 | orchestrator | `get_repo_scopes` only | `ls`, `read_file` | `task`, `write_todos` |
 | explorer (×N) | `get_repo_tree`, `get_file_contents`, `search_code` | `read_file`, `write_file` | — |
-| doc-writer | — | `ls`, `read_file` | — |
+| doc-writer | — | `ls`, `read_file`, `write_file` | — |
+| link-checker | `get_repo_tree`, in Python | reads `/guide.md` directly | **no tools — it has no model to offer them to** |
 
 Two mechanisms produce that table, and they are not interchangeable.
 [`middleware.py`](repo_cartographer/middleware.py) hides tools from the
@@ -541,7 +669,7 @@ them; configure one and it is used automatically.
 uv run pytest
 ```
 
-Expect `79 passed, 1 deselected`. These tests hit the real GitHub API with no
+Expect `105 passed, 1 deselected`. These tests hit the real GitHub API with no
 mocking, so a pass means your token works and the tools genuinely function. No
 model is called anywhere in the suite, so it costs nothing against your provider
 quota. A few tests skip themselves rather than fail if GitHub is unreachable or
@@ -641,14 +769,18 @@ repo-cartographer/
 │   ├── prompts.py       The three prompts: orchestrator, explorer, doc-writer
 │   ├── middleware.py    Hides the built-ins the orchestrator doesn't use
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
+│   ├── citations.py     Does this cited path exist? — no LLM code
+│   ├── link_checker.py  The graph around citations.py — a sub-agent with no model
 │   └── tools.py         Four GitHub API functions — no LLM code
 ├── scripts/
 │   ├── measure_context.py   Phase 3's A/B: offloading on vs. off
 │   ├── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
-│   └── run_evals.py         Phase 5: six repos in, one score out
+│   ├── run_evals.py         Phase 5: six repos in, one score out
+│   └── prove_link_checker.py  Phase 6: plant a fake path, watch it get caught
 ├── tests/
 │   ├── test_tools.py    Live tests against the real GitHub API
-│   ├── test_wiring.py   The three-way split, asserted without a model
+│   ├── test_wiring.py   The four-way split, asserted without a model
+│   ├── test_citations.py  Does the checker catch an invented path? (no model)
 │   ├── test_evals.py    Is the eval set itself true? (live GitHub, no model)
 │   └── evals/
 │       ├── known_repos.jsonl   The dataset: 6 repos, 31 expected facts
@@ -702,6 +834,8 @@ uv run scripts/run_evals.py                     # Phase 5's score, 6 model runs
 uv run scripts/run_evals.py --case flask        # ...one repo only
 uv run scripts/run_evals.py --score-only        # re-score recorded runs, free
 uv run scripts/run_evals.py --history           # every run recorded so far
+
+uv run scripts/prove_link_checker.py            # Phase 6's proof, ~2 model requests
 ```
 
 `measure_context.py` spends real model quota — two runs per `--repeats`, each a

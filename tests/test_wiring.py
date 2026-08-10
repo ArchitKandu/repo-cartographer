@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from repo_cartographer.link_checker import DEFAULT_GUIDE_PATH
 from repo_cartographer.prompts import (
     DOC_WRITER_PROMPT,
     EXPLORER_PROMPT,
@@ -64,9 +65,19 @@ EXPECTED = {
     # *in* src/ comes back through `task`.
     "orchestrator": {"get_repo_scopes", "ls", "read_file", "task", "write_todos"},
     "explorer": GITHUB_TOOLS | {"read_file", "write_file"},
-    # The whole design in one line. Two read-only tools, no repository access.
-    "doc-writer": {"ls", "read_file"},
+    # Still the whole design in one line: three workspace tools and no repository
+    # access. `write_file` arrived at Phase 6 so the guide becomes a file the
+    # link-checker can read; it does not touch the blindfold, because the
+    # workspace is not GitHub.
+    "doc-writer": {"ls", "read_file", "write_file"},
 }
+
+# The delegates that are language models, which since Phase 6 is not all of them.
+# `link-checker` is a CompiledSubAgent — a graph, no prompt, no tools, no model —
+# so every assertion below about prompts and tool sets would be meaningless for
+# it, and a spec-shaped test that silently skipped it would be worse than one
+# that names the distinction.
+MODEL_SUBAGENTS = ("explorer", "doc-writer")
 
 # Every tool name that exists anywhere in the system: the deepagents built-ins
 # that could show up if a restriction stopped working, plus this project's own.
@@ -133,8 +144,25 @@ def _declared_tools(spec: SubAgent) -> set[str]:
 # --------------------------------------------------------------------------- #
 
 
-def test_exactly_two_subagents(specs: list[SubAgent]) -> None:
-    assert set(_by_name(specs)) == {"explorer", "doc-writer"}
+def test_exactly_three_subagents(specs: list[SubAgent]) -> None:
+    assert set(_by_name(specs)) == {"explorer", "doc-writer", "link-checker"}
+
+
+def test_the_link_checker_holds_no_model(specs: list[SubAgent]) -> None:
+    """Phase 6's claim, asserted at the only place it could stop being true.
+
+    A `CompiledSubAgent` carries a `runnable` and nothing else; a `SubAgent`
+    carries a prompt and tools and gets a model built for it. If someone ever
+    "fixed" the link-checker by giving it a system prompt, the citation check
+    would quietly become an opinion — it would still return verdicts, they would
+    still look like verdicts, and they would sometimes be wrong for reasons no
+    test downstream could see. So the absence of a prompt is the assertion.
+    """
+    checker = _by_name(specs)["link-checker"]
+    assert "runnable" in checker
+    assert not {"system_prompt", "tools", "model"} & set(checker)
+    # And it really is a graph that can be invoked, not a placeholder.
+    assert hasattr(checker["runnable"], "invoke")
 
 
 def test_every_spec_declares_tools_explicitly(specs: list[SubAgent]) -> None:
@@ -145,7 +173,8 @@ def test_every_spec_declares_tools_explicitly(specs: list[SubAgent]) -> None:
     have handed it the GitHub tools. Both are wrong and neither announces itself,
     so the key is required rather than defaulted.
     """
-    for name, spec in _by_name(specs).items():
+    for name in MODEL_SUBAGENTS:
+        spec = _by_name(specs)[name]
         assert "tools" in spec, f"{name} would inherit the orchestrator's tools"
 
 
@@ -168,14 +197,15 @@ def test_each_spec_restates_filesystem_middleware(specs: list[SubAgent]) -> None
     away from the orchestrator — does not reach either delegate. Each spec has to
     narrow its own, and the narrowing is what this asserts.
     """
-    for name, spec in _by_name(specs).items():
+    for name in MODEL_SUBAGENTS:
+        spec = _by_name(specs)[name]
         assert _fs_middleware(spec) is not None, f"{name} would get every built-in"
 
 
 def test_workspace_tools_match_the_intended_split(specs: list[SubAgent]) -> None:
-    for name, spec in _by_name(specs).items():
+    for name in MODEL_SUBAGENTS:
         expected = EXPECTED[name] - GITHUB_TOOLS
-        assert _workspace_tools(spec) == expected
+        assert _workspace_tools(_by_name(specs)[name]) == expected
 
 
 def test_no_subagent_can_run_a_shell_or_delete_notes(specs: list[SubAgent]) -> None:
@@ -185,7 +215,8 @@ def test_no_subagent_can_run_a_shell_or_delete_notes(specs: list[SubAgent]) -> N
     at the notes that are a run's durable output. Neither belongs anywhere in this
     system, and a set equality above passing is easy to misread as covering it.
     """
-    for name, spec in _by_name(specs).items():
+    for name in MODEL_SUBAGENTS:
+        spec = _by_name(specs)[name]
         held = _workspace_tools(spec) | _declared_tools(spec)
         assert not held & {"execute", "delete", "glob", "grep"}, f"{name} holds one"
 
@@ -249,6 +280,22 @@ def test_the_notes_handoff_is_stated_on_both_sides() -> None:
     """
     assert "/notes/" in ORCHESTRATOR_PROMPT
     assert "the path your brief gives you" in EXPLORER_PROMPT
+
+
+def test_the_guide_handoff_is_stated_on_both_sides() -> None:
+    """Phase 6's convention, and it is agreed by two prompts and one module.
+
+    The orchestrator tells the doc-writer to save the guide at `/guide.md` and
+    then briefs the link-checker to read that same path; `link_checker.py` falls
+    back to it when a brief names none. Nothing in the graph enforces the
+    agreement. If one side drifts, the doc-writer writes a file nobody reads and
+    the checker finds nothing to check — and "nothing to check" must never be
+    mistaken for "nothing wrong", which is why the fallback in `link_checker.py`
+    is pinned here alongside the prompts rather than trusted.
+    """
+    assert DEFAULT_GUIDE_PATH == "/guide.md"
+    assert DEFAULT_GUIDE_PATH in ORCHESTRATOR_PROMPT
+    assert DEFAULT_GUIDE_PATH in DOC_WRITER_PROMPT
 
 
 # --------------------------------------------------------------------------- #
@@ -339,7 +386,11 @@ def test_task_menu_lists_only_our_two_subagents(compiled: Any) -> None:
     in place. So the only way to know the registration in `agent.py` worked is to
     read the menu the model is shown.
     """
-    assert _menu_names(_task_tool(compiled).description) == {"explorer", "doc-writer"}
+    assert _menu_names(_task_tool(compiled).description) == {
+        "explorer",
+        "doc-writer",
+        "link-checker",
+    }
 
 
 @needs_model
@@ -353,15 +404,22 @@ def test_compiled_subagents_got_the_tools_their_specs_asked_for(compiled: Any) -
     closure, which is private structure — see this module's docstring on why that
     is worth doing once.
     """
-    graphs = {}
+    graphs: dict[str, Any] = {}
     for cell in (c.cell_contents for c in (_task_tool(compiled).func.__closure__ or ())):
-        if isinstance(cell, dict):
-            graphs = {
-                name: sub
-                for name, sub in cell.items()
-                if hasattr(sub, "nodes") and "tools" in sub.nodes
-            }
+        if isinstance(cell, dict) and all(hasattr(sub, "nodes") for sub in cell.values()):
+            graphs = dict(cell)
 
-    assert set(graphs) == {"explorer", "doc-writer"}, "could not reach the sub-agents"
-    for name, graph in graphs.items():
-        assert _tool_node_names(graph) == EXPECTED[name]
+    assert set(graphs) == {
+        "explorer",
+        "doc-writer",
+        "link-checker",
+    }, "could not reach the sub-agents"
+
+    for name in MODEL_SUBAGENTS:
+        assert _tool_node_names(graphs[name]) == EXPECTED[name]
+
+    # The link-checker has no tool node at all, because it has no model to offer
+    # tools to. Asserted rather than skipped: filtering it out and checking the
+    # other two would pass just as happily if it had quietly become an ordinary
+    # agent, which is the one change that would turn its verdicts into guesses.
+    assert "tools" not in graphs["link-checker"].nodes
