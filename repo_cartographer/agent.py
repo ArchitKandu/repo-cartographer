@@ -4,9 +4,9 @@ Phase 3 was one agent with a workspace. Phase 4 changes one thing: the work is
 split three ways. An `explorer` holds the reading tools and reads code; a
 `doc-writer` holds no repository access at all and writes the guide from the
 explorers' notes; the orchestrator holds only `get_repo_scopes`, which reports a
-repository's shape and never its contents, and divides the work on that basis. No
-skills yet (Phase 7). Everything the system knows about a repository it learns at
-run time through `tools.py`.
+repository's shape and never its contents, and divides the work on that basis.
+Everything the system knows about a repository it learns at run time through
+`tools.py`.
 
 4b added the fan-out: rather than one explorer over the whole repository, the
 orchestrator reads the scope list and dispatches up to three explorers — one per
@@ -36,16 +36,23 @@ first defence in this system against a wrong citation that is arithmetic rather
 than instruction. The doc-writer now saves its guide to the workspace so there
 is a file for it to check.
 
+Phase 7 moved two kinds of instruction out of the prompts and into files a person
+can edit without opening Python: `skills/*/SKILL.md`, which the explorer reads
+only when the repository matches the ecosystem it describes, and `AGENTS.md`,
+this project's house style, appended to the doc-writer on every run. `skills.py`
+holds both, and the composite backend that makes the skills mount reachable by
+the explorer's own `read_file`.
+
 What lives here is the wiring — models, tools, middleware, and the order they go
-in. The instructions each agent works from are in `prompts.py`, and the model
-they reason with is in `models.py`, so neither is a reason to edit this file.
+in. The instructions each agent works from are in `prompts.py`, `skills/` and
+`AGENTS.md`, and the model they reason with is in `models.py`, so none of them is
+a reason to edit this file.
 """
 
 from pathlib import Path
 from typing import Any
 
 from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
-from deepagents.backends import FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware import FilesystemMiddleware
 from deepagents.profiles import (
@@ -66,6 +73,12 @@ from repo_cartographer.prompts import (
     DOC_WRITER_PROMPT,
     EXPLORER_PROMPT,
     ORCHESTRATOR_PROMPT,
+)
+from repo_cartographer.skills import (
+    HOUSE_STYLE_HEADER,
+    SKILLS_MOUNT,
+    build_backend,
+    house_style,
 )
 from repo_cartographer.tools import (
     get_file_contents,
@@ -89,6 +102,11 @@ WORKSPACE.mkdir(exist_ok=True)
 # source file — large enough that the agent's own notes and small files stay
 # inline, small enough that the big reads offload.
 TOOL_RESULT_TOKEN_LIMIT = 2_000
+
+# Read once at import rather than per `build_subagents` call: the file does not
+# change while the process runs, and reading it inside the spec builder would put
+# a disk hit in the path `tests/test_wiring.py` calls repeatedly.
+_HOUSE_STYLE = house_style()
 
 # `create_deep_agent` adds a `general-purpose` sub-agent to the `task` tool's menu
 # unless told otherwise, described to the model as having "all tools as the main
@@ -201,6 +219,15 @@ def build_subagents(
             "system_prompt": EXPLORER_PROMPT,
             "tools": [get_repo_tree, get_file_contents, search_code],
             "middleware": explorer_middleware,
+            # Phase 7, and it goes on this agent alone. The explorer is the only
+            # one deciding which files to open, so ecosystem knowledge — read
+            # `package.json` before guessing at `src/`, `lib/` is usually build
+            # output — is worth something here and worth nothing anywhere else.
+            # `SkillsMiddleware` shows it one line per skill and lets it read the
+            # rest only if the repository matches, so a Node run never pays for
+            # the Python conventions. See `skills.py` for how the mount is made
+            # reachable by this agent's own `read_file`.
+            "skills": [SKILLS_MOUNT],
         },
         {
             "name": "doc-writer",
@@ -211,7 +238,14 @@ def build_subagents(
                 "should mention must already be in the notes. Brief it with the "
                 "question, the exact notes paths, and where to save the guide."
             ),
-            "system_prompt": DOC_WRITER_PROMPT,
+            # The house style is appended rather than woven in: everything in
+            # DOC_WRITER_PROMPT is *how to do the job*, and everything in
+            # AGENTS.md is *how this project's guides read*. Keeping the seam
+            # visible is what lets a non-programmer change the second without
+            # touching the first — which is the whole of Phase 7.
+            "system_prompt": DOC_WRITER_PROMPT + HOUSE_STYLE_HEADER + _HOUSE_STYLE
+            if _HOUSE_STYLE
+            else DOC_WRITER_PROMPT,
             # Not an oversight, and not inheritance — the guarantee the whole
             # design rests on. An agent that cannot reach GitHub cannot cite a file
             # nobody read.
@@ -247,7 +281,12 @@ def build_agent(
     # `backend` to the summarization middleware and the general-purpose sub-agent
     # as well as to the filesystem tools, so handing those a different instance
     # than the one the tools write through would split the workspace in two.
-    backend = FilesystemBackend(root_dir=WORKSPACE)
+    #
+    # Since Phase 7 it is a composite rather than a bare filesystem: the writable
+    # workspace at `/`, plus a read-only mount of `./skills` at `/skills/`. That
+    # is what lets `SkillsMiddleware` advertise a path the explorer's own
+    # `read_file` can actually open — see `skills.py`.
+    backend = build_backend(WORKSPACE)
 
     # Annotated rather than inferred: each middleware class parameterises
     # `AgentMiddleware` differently, so mypy joins the list to a type narrower

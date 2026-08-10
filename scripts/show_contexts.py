@@ -143,7 +143,12 @@ def run(question: str) -> tuple[list[Thread], str, list[int]]:
         subgraphs=True,
         stream_mode="updates",
     ):
-        for node_update in (update or {}).values():
+        # `stream(subgraphs=True)` is typed as yielding `Any`, so both the
+        # namespace and the update are narrowed before use rather than trusted.
+        if not isinstance(update, dict):
+            continue
+        key: tuple[str, ...] = tuple(namespace)
+        for node_update in update.values():
             if not isinstance(node_update, dict):
                 continue
             for message in node_update.get("messages", []) or []:
@@ -151,7 +156,7 @@ def run(question: str) -> tuple[list[Thread], str, list[int]]:
                 # one once or every token figure here is inflated.
                 if id(message) not in seen:
                     seen.add(id(message))
-                    per_namespace[namespace].append(message)
+                    per_namespace[key].append(message)
 
     # Since 4b there can be several explorers in one run, and three rows all
     # labelled "explorer" would be unreadable. Number repeats in the order the

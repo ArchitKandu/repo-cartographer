@@ -10,11 +10,25 @@ defines the agent.
 The split earned itself at Phase 4. One agent needs one prompt, which is why this
 file did not exist before then — but an orchestrator plus an explorer plus a
 doc-writer needs three, and three prompts of this length inline would bury the
-twenty lines of `create_deep_agent` call they surround. By Phase 7 the
-ecosystem-specific parts of these prompts move out again, into `skills/`, loaded
-only when the repository in question is the matching kind. This file is the
-staging ground for that: what lives here is what every run needs regardless of
-what it is pointed at.
+twenty lines of `create_deep_agent` call they surround.
+
+Phase 7 split it again, in the other direction, and this time by *subject* rather
+than by agent. What lives here now is only what every run needs regardless of
+what it is pointed at:
+
+- **`skills/*/SKILL.md`** took the ecosystem knowledge. `EXPLORER_PROMPT` used to
+  name `pyproject.toml` and `package.json` and `index.*` in one breath; it now
+  says "check your skills, read the one that matches", and the two files behind
+  that carry far more detail than a shared prompt could have afforded — because
+  a Node run no longer pays for the Python conventions.
+- **`AGENTS.md`** took this project's house style, and is appended to
+  `DOC_WRITER_PROMPT` at build time. It is deliberately *additive*: the four
+  sections a guide must have, and the rules that keep it truthful, stay here,
+  because they are the job rather than the styling. See `skills.py`.
+
+The test of whether that split is real is whether anything was removed. It was:
+the ecosystem specifics are gone from this file rather than duplicated into the
+skills.
 
 The three prompts are not independent. They describe one division of labour from
 three sides, and they agree on specifics that are not enforced anywhere in code:
@@ -246,18 +260,27 @@ will not find the file, because the file is not there.
    directory, named in your brief, or the whole repository when the brief says so.
    Other explorers may be running against other scopes at the same time; you
    cannot see them and do not need to.
-2. **Choose what to read.** You cannot read a whole scope and should not try.
-   Prioritise the manifest (`pyproject.toml`, `package.json`), the entry points
-   (`__init__.py`, `main.*`, `index.*`), and then the modules your question
-   points at. Skip lockfiles, vendored directories, generated bundles, and
-   anything larger than a few hundred KB.
-3. **Read, then follow the imports — as far as your scope.** A module's imports
+2. **Check your skills before you choose what to read.** You have a skills
+   library, listed further down this prompt with one line describing each. Look
+   at the file list from step 1 and see whether one of them matches the
+   repository you are in. If it does, `read_file` it before deciding anything
+   else — it tells you which files answer which questions in that ecosystem,
+   which order to read them in, and which directories are generated output
+   rather than source. Read the one that matches and not the others; a skill for
+   an ecosystem this repository is not written in has nothing to tell you.
+3. **Choose what to read.** You cannot read a whole scope and should not try.
+   Read the manifest first, then the entry point, then the modules your question
+   points at — your skill will name those precisely for this ecosystem, and
+   without one, prefer the file a newcomer would open first. Skip lockfiles,
+   vendored directories, generated bundles, and anything larger than a few
+   hundred KB.
+4. **Read, then follow the imports — as far as your scope.** A module's imports
    tell you what it depends on and where to look next. Let the code decide your
    next read, not your expectations. When an import leaves your scope, do not
    follow it: write down the dependency and which file it points at, and move
    on. Another explorer has that ground, and reading it twice costs the job
    twice.
-4. **Write your notes, once, when you are done reading.** One `write_file` call
+5. **Write your notes, once, when you are done reading.** One `write_file` call
    to the path your brief gives you, exactly as written — the doc-writer is told
    to look there and nowhere else. If the brief's path does not begin with `/`, or
    begins with `/workspace`, fix it to a single leading slash: the workspace is the
@@ -267,8 +290,9 @@ will not find the file, because the file is not there.
    it in a single call at the end — a second write to the same path destroys the
    first. For each file worth mentioning: the path, what it is for, and the
    handful of names — functions, classes, routes — another reader would need.
-   Then the cross-scope dependencies from step 3.
-5. **Report.** Your final message: two or three sentences on what this scope
+   Then the cross-scope dependencies from step 4, and anything your skill said
+   to record every time.
+6. **Report.** Your final message: two or three sentences on what this scope
    does, the notes path, the count of files you read against the count in scope,
    and anything you deliberately skipped. Keep it short. The notes carry the
    detail; this only has to tell your caller what happened and where to look.

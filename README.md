@@ -33,7 +33,8 @@ reasoning behind the ordering.
 | 4b | Parallel fan-out per directory | **Done — trace verified, this is what runs today** |
 | 5 | Eval set: six repos, one score | Done |
 | 6 | Link-checker: a sub-agent with no model in it | Done |
-| 7+ | Skills, approval gates, packaging | Planned |
+| 7 | Skills + AGENTS.md: instructions out of the prompts | Done |
+| 8+ | Approval gates, packaging | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
 tool before calling any of yours, unprompted"* — is met. On `psf/requests` with
@@ -394,11 +395,113 @@ it: **a two-point move on one sample per case is sampling, not causation.** Runs
 get measurably slower — 249s against 214s on `psf/requests` — which is the honest
 cost of an extra delegate and a guide emitted twice.
 
+### Phase 7: the instructions moved out of the code
+
+By Phase 6 the prompts were carrying four jobs at once — how to explore any
+repository, what Python layouts look like, what Node layouts look like, and what
+this project's guides read like. `EXPLORER_PROMPT` named `pyproject.toml` and
+`package.json` and `index.*` in a single breath, and every run paid for all of it
+regardless of what the repository was written in.
+
+Phase 7 splits those apart into files a person can edit without opening Python:
+
+| File | What it carries | Loaded |
+|---|---|---|
+| `skills/python-repo/SKILL.md` | which files answer which questions in a Python repo | **only when the explorer decides it matches** |
+| `skills/node-repo/SKILL.md` | the same for JavaScript and TypeScript | same |
+| `AGENTS.md` | this project's house style for a guide | always, into the doc-writer |
+
+That difference is the design. A skill is *conditional* — the explorer sees one
+line describing each and reads the full file only if the repository matches — so
+a Node run never pays for the Python conventions. `AGENTS.md` is
+*unconditional*, because "a table row naming a directory has told nobody
+anything" is true of every repository there is.
+
+**The definition of done is two runs, back to back, with no code change between
+them:**
+
+```console
+$ uv run scripts/show_skills.py
+
+repository            expected skill  skills actually read
+------------------------------------------------------------------------
+psf/requests          python-repo     python-repo
+chalk/chalk           node-repo       node-repo
+------------------------------------------------------------------------
+
+psf/requests — what reached the guide (python-repo markers):
+  [x] packaging manifest   [x] layout   [x] how tests run
+
+chalk/chalk — what reached the guide (node-repo markers):
+  [x] package.json   [x] entry point field   [x] scripts
+
+PASS — each run read exactly the skill for its own ecosystem and never the other one.
+```
+
+The first column is the hard evidence and it needs no interpretation: the
+explorers' `read_file` calls say which SKILL.md was opened, and — more usefully —
+which was not. A run that read both would have demonstrated thoroughness, not
+selection. The markers underneath are keyword checks, corroboration rather than
+proof, and the script says so.
+
+You can see the node skill's fingerprint in the guide it produced for
+`chalk/chalk`:
+
+> Chalk relies on vendored dependencies for ANSI definitions and color support
+> detection, which are located in `source/vendor/` and accessed via Node.js
+> **subpath imports defined in `package.json`**.
+
+Nothing in any prompt mentions subpath imports or vendored directories.
+`skills/node-repo/SKILL.md` does — it warns that a vendored directory can be
+load-bearing rather than skippable, and that `package.json` names the entry
+points no directory listing reveals.
+
+**The split is real because something was removed.** The ecosystem specifics are
+gone from `prompts.py`, not duplicated into the skills. `AGENTS.md` is
+deliberately additive and says so in its own text: the four sections a guide must
+have, and the rules that keep it truthful, stay in `DOC_WRITER_PROMPT`, because
+those are the job rather than the styling.
+
+**The skills mount is read-only, and that is not fastidiousness.** `./skills`
+lives inside this git repository, so an explorer holding `write_file` and a plain
+mount could write through it into the project's own source — including into the
+instructions it is currently following. `ReadOnlyBackend` makes that impossible
+rather than forbidden, which is the same argument the doc-writer's empty tool
+list makes.
+
+**Phase 5's instrument had to grow to keep up.** `run_evals.py` stamps every
+recorded run with a fingerprint of the instructions that produced it, so
+re-scoring after an edit warns you the guides are stale. That fingerprint hashed
+the three prompts — which was the whole set until now. `AGENTS.md` and the
+skills are instructions too, and they are the ones most likely to be edited,
+precisely because editing them needs no Python. A fingerprint blind to them would
+have let the cheapest kind of change alter the output while every recorded score
+kept reading as current. It now covers all of them, and a test moves a byte in a
+`SKILL.md` to prove the digest follows.
+
+Two caveats worth stating. The run above used `gemini-3.1-flash-lite` rather than
+the usual `gemini-3.5-flash-lite`, because the latter's daily quota was spent —
+so it is not directly comparable to the token tables above, and the script prints
+the model for that reason. And skill *selection* is a model decision, so `PASS`
+is a result, not a guarantee; the script reports `INCONCLUSIVE` rather than
+failure when no skill is read, because that is a prompt-adherence finding worth
+recording.
+
+**The scored before/after is half-done, and the missing half is quota, not
+work.** The eval set gained one ecosystem fact per case — the packaging manifest
+each skill tells the explorer to record by name — and re-scoring the recorded
+Phase 6 guides against it costs nothing: **36 of 37**. The pre-skill guides
+already named the manifest in five of six cases, so this particular fact is a
+weak discriminator, which is worth saying rather than hiding. The matching
+after-sweep wants the same model as the before-runs to be a controlled
+comparison, and that model's daily quota is spent; it is one command
+(`uv run scripts/run_evals.py`) once it resets.
+
 What works right now: an orchestrator that sizes a repository up and splits it
 across up to three explorers, explorers that read one directory each and take
 notes, and a doc-writer that turns those notes into a guide
 with an architecture overview, a where-things-happen table, and an explicit list
-of what went unread. Still ahead: skills (Phase 7), approval gates (Phase 8).
+of what went unread. Still ahead: approval gates (Phase 8), packaging (Phase 9).
 Paths in the guide carry three prompts' instruction to cite only verified ones,
 one structural guarantee — the doc-writer has no GitHub access, so it cannot
 describe a file nobody read — and, since Phase 6, one arithmetic check: every
@@ -467,8 +570,8 @@ there. Every agent gets a deliberately narrow set:
 | | GitHub | workspace | other |
 |---|---|---|---|
 | orchestrator | `get_repo_scopes` only | `ls`, `read_file` | `task`, `write_todos` |
-| explorer (×N) | `get_repo_tree`, `get_file_contents`, `search_code` | `read_file`, `write_file` | — |
-| doc-writer | — | `ls`, `read_file`, `write_file` | — |
+| explorer (×N) | `get_repo_tree`, `get_file_contents`, `search_code` | `read_file`, `write_file` | `skills/` (read-only) |
+| doc-writer | — | `ls`, `read_file`, `write_file` | `AGENTS.md`, always applied |
 | link-checker | `get_repo_tree`, in Python | reads `/guide.md` directly | **no tools — it has no model to offer them to** |
 
 Two mechanisms produce that table, and they are not interchangeable.
@@ -669,7 +772,7 @@ them; configure one and it is used automatically.
 uv run pytest
 ```
 
-Expect `105 passed, 1 deselected`. These tests hit the real GitHub API with no
+Expect `118 passed, 1 deselected`. These tests hit the real GitHub API with no
 mocking, so a pass means your token works and the tools genuinely function. No
 model is called anywhere in the suite, so it costs nothing against your provider
 quota. A few tests skip themselves rather than fail if GitHub is unreachable or
@@ -771,16 +874,23 @@ repo-cartographer/
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
 │   ├── citations.py     Does this cited path exist? — no LLM code
 │   ├── link_checker.py  The graph around citations.py — a sub-agent with no model
+│   ├── skills.py        Mounts skills/ read-only; loads AGENTS.md
 │   └── tools.py         Four GitHub API functions — no LLM code
+├── skills/
+│   ├── python-repo/SKILL.md   Read only when the repo is Python
+│   └── node-repo/SKILL.md     Read only when the repo is JS/TS
+├── AGENTS.md            House style — appended to the doc-writer every run
 ├── scripts/
 │   ├── measure_context.py   Phase 3's A/B: offloading on vs. off
 │   ├── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
 │   ├── run_evals.py         Phase 5: six repos in, one score out
-│   └── prove_link_checker.py  Phase 6: plant a fake path, watch it get caught
+│   ├── prove_link_checker.py  Phase 6: plant a fake path, watch it get caught
+│   └── show_skills.py       Phase 7: a Python repo and a JS repo, back to back
 ├── tests/
 │   ├── test_tools.py    Live tests against the real GitHub API
 │   ├── test_wiring.py   The four-way split, asserted without a model
 │   ├── test_citations.py  Does the checker catch an invented path? (no model)
+│   ├── test_skills.py   Are the skills found, reachable, and unwritable? (no model)
 │   ├── test_evals.py    Is the eval set itself true? (live GitHub, no model)
 │   └── evals/
 │       ├── known_repos.jsonl   The dataset: 6 repos, 31 expected facts
@@ -836,6 +946,7 @@ uv run scripts/run_evals.py --score-only        # re-score recorded runs, free
 uv run scripts/run_evals.py --history           # every run recorded so far
 
 uv run scripts/prove_link_checker.py            # Phase 6's proof, ~2 model requests
+uv run scripts/show_skills.py                   # Phase 7's proof, 2 model runs
 ```
 
 `measure_context.py` spends real model quota — two runs per `--repeats`, each a

@@ -82,26 +82,44 @@ MAX_RECORDED_RUNS = 20
 
 
 def prompt_fingerprint() -> str:
-    """A short hash of all three prompts, stamped into every recorded run.
+    """A short hash of every instruction the agents work from.
 
     The point is not integrity, it is staleness. `--score-only` is free and
-    instant, which makes it exactly the thing you reach for after editing a
-    prompt — and re-scoring a guide produced by the *previous* prompt would read
-    as "the edit changed nothing." Imported here rather than at module scope so
-    `--history` still works with no provider key: `prompts.py` is plain strings
-    and pulls in nothing, but keeping every agent import inside a function makes
-    that a property of the file rather than a fact to re-verify.
+    instant, which makes it exactly the thing you reach for after editing an
+    instruction — and re-scoring a guide produced by the *previous* one would
+    read as "the edit changed nothing."
+
+    Which makes what is hashed a correctness question rather than a detail.
+    Until Phase 7 the instructions were three strings in `prompts.py` and that
+    was the whole set. They are now four kinds of thing: those prompts,
+    `AGENTS.md`, and each `SKILL.md`. Hashing only the prompts would leave the
+    two newest — the ones most likely to be edited, since editing them needs no
+    Python — changing behaviour without ever marking a record stale. That is the
+    exact failure this function exists to prevent, so it covers all of them.
+
+    Imported here rather than at module scope so `--history` still works with no
+    provider key: `prompts.py` and `skills.py` pull in nothing heavy, but keeping
+    every agent import inside a function makes that a property of the file rather
+    than a fact to re-verify.
     """
     from repo_cartographer.prompts import (
         DOC_WRITER_PROMPT,
         EXPLORER_PROMPT,
         ORCHESTRATOR_PROMPT,
     )
+    from repo_cartographer.skills import SKILLS_DIR, available_skills, house_style
 
-    # NUL-separated so that moving a sentence from one prompt to another changes
-    # the digest — concatenating them plainly would not.
-    joined = f"{ORCHESTRATOR_PROMPT}\0{EXPLORER_PROMPT}\0{DOC_WRITER_PROMPT}"
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:8]
+    parts = [ORCHESTRATOR_PROMPT, EXPLORER_PROMPT, DOC_WRITER_PROMPT, house_style()]
+    # Sorted, so the digest depends on the skills' content and not on the order
+    # the filesystem happened to list them in.
+    parts += [
+        (SKILLS_DIR / name / "SKILL.md").read_text(encoding="utf-8")
+        for name in available_skills()
+    ]
+
+    # NUL-separated so that moving a sentence from one file to another changes the
+    # digest — concatenating them plainly would not.
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:8]
 
 
 # --------------------------------------------------------------------------- #

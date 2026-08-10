@@ -14,7 +14,7 @@ all.** Everything below is the detail of that sentence.
 - [The files, and how they connect](#the-files-and-how-they-connect)
 - [A real run, step by step](#a-real-run-step-by-step)
 - [The handoff contract](#the-handoff-contract)
-- [Eleven decisions that are the architecture](#eleven-decisions-that-are-the-architecture)
+- [Thirteen decisions that are the architecture](#thirteen-decisions-that-are-the-architecture)
 - [What it costs](#what-it-costs)
 - [Failure modes we have actually seen](#failure-modes-we-have-actually-seen)
 - [How to verify any of this](#how-to-verify-any-of-this)
@@ -187,29 +187,31 @@ actually *says* has to come back from an explorer.
 ## The files, and how they connect
 
 ```
-   tools.py        models.py      prompts.py    middleware.py   citations.py
-   ─────────       ─────────      ──────────    ─────────────   ────────────
-   4 functions     the model      3 job         hides tools     does this path
-   over GitHub     + request      descriptions  from the        exist? no AI,
-   REST API        queue          (strings)     orchestrator    no agent code
-       │               │              │              │            │      ▲
-       │               │              │              │            │      │
-       ├───────────────┴──────────────┴──────────────┴────────────┘      │
-       │                             ▼                                   │
-       │                        agent.py                        link_checker.py
-       │                the org chart — the ONLY file      the graph wrapper: brief
-       │               that imports all the others  ◄───   in, verdict out, 1 node
-       │                             │
-       │    ┌──────────┬─────────────┼─────────────┬──────────────────┐
-       │    ▼          ▼             ▼             ▼                  ▼
-       │ main.py  show_contexts  run_evals  prove_link_checker   test_wiring
-       │  (CLI)   (per-agent)    (scores 6)  (the phase-6 proof) (the org chart)
+   tools.py     models.py    prompts.py   middleware.py  citations.py  skills.py
+   ─────────    ─────────    ──────────   ─────────────  ────────────  ─────────
+   4 functions  the model    3 job        hides tools    does this     mounts
+   over GitHub  + request    descriptions from the       path exist?   skills/ +
+   REST API     queue        (strings)    orchestrator   no AI at all  AGENTS.md
+       │            │            │             │            │   ▲          │
+       ├────────────┴────────────┴─────────────┴────────────┴───│──────────┘
+       │                          ▼                             │
+       │                     agent.py                    link_checker.py
+       │             the org chart — the ONLY file   the graph wrapper: brief
+       │            that imports all the others  ◄──  in, verdict out, 1 node
+       │                          │
+       │   skills/*/SKILL.md and AGENTS.md are not imported by anything.
+       │   They are read at run time, through the backend skills.py builds.
+       │                          │
+       │   ┌─────────┬───────────┬─┴─────────┬─────────────┬─────────────┐
+       │   ▼         ▼           ▼           ▼             ▼             ▼
+       │ main.py show_contexts run_evals prove_link_  show_skills  test_wiring
+       │  (CLI)   (per-agent)  (scores 6)  checker    (py then js) (org chart)
        │
        └──► __init__.py, tests/test_tools.py, tests/test_evals.py — tools only,
             never agent.py
 ```
 
-**The shape is the point.** The five modules on the top row import *nothing* from
+**The shape is the point.** The six modules on the top row import *nothing* from
 this project except each other's leaves. That makes each one independently
 testable and independently replaceable — swap the model, and you touch one file;
 reword a prompt, one file. `agent.py` is the single place where they are composed
@@ -228,6 +230,8 @@ lets a graph call one.
 | `middleware.py` | `RestrictToolsMiddleware` | Hides built-in tools from the orchestrator per model request |
 | `citations.py` | `check_citations`, `cited_paths` | The second deterministic layer. Decides whether a cited path exists, with no model and no agent code, so the verdict is a fact. Testable with a list of strings |
 | `link_checker.py` | `build_link_checker`, `parse_brief` | The graph around `citations.py`: parse a brief, read the guide, return a verdict. Separate so the part that decides anything needs no graph to test |
+| `skills.py` | `build_backend`, `ReadOnlyBackend`, `house_style` | Where the instructions that are *not* Python get mounted. Composes the writable workspace with a read-only `/skills/` route, and loads `AGENTS.md` |
+| `skills/*/SKILL.md`, `AGENTS.md` | Ecosystem conventions; house style | Not code at all. Edited by a person, loaded at run time, and the reason `prompts.py` stopped growing per ecosystem |
 | `agent.py` | `build_subagents()`, `build_agent()`, `ask()` | The org chart: who reports to whom, who gets which tools |
 | `__init__.py` | Re-exports the GitHub tools **and deliberately not `agent`** | Importing `agent` builds a model and needs an API key; re-exporting it would make `import repo_cartographer` fail with no key configured, including during test collection |
 
@@ -302,6 +306,8 @@ brief carries the owner, the repo, **its own** scope, the question in full, and
 explorer (scope: src)             explorer (scope: root)
 ──────────────────────────        ──────────────────────────
 get_repo_tree → filter to src/    get_repo_tree → filter to root
+read_file /skills/python-repo/    read_file /skills/python-repo/
+  SKILL.md   ← Phase 7              SKILL.md
 get_file_contents __init__.py     get_file_contents pyproject.toml
 get_file_contents sessions.py     get_file_contents setup.py
 get_file_contents adapters.py     …
@@ -418,14 +424,23 @@ agents, and there are no others:
 2. **Files in the shared workspace** — durable, and the real deliverable.
 
 ```
-./workspace/                  ← one FilesystemBackend instance, shared by all agents
-├── notes/
+/                             ← one CompositeBackend, shared by every agent
+├── notes/                       ↓ routes to ./workspace — read-write
 │   ├── src.md                ← explorer #1 writes, doc-writer reads
 │   └── root.md               ← explorer #2 writes, doc-writer reads
 ├── guide.md                  ← doc-writer writes, link-checker reads
-└── large_tool_results/       ← offloading stashes oversized tool results here
-    └── aBqjVMEE
+├── large_tool_results/       ← offloading stashes oversized tool results here
+│   └── aBqjVMEE
+└── skills/                      ↓ routes to ./skills — READ-ONLY
+    ├── python-repo/SKILL.md  ← explorer reads, only when the repo is Python
+    └── node-repo/SKILL.md    ← explorer reads, only when the repo is JS/TS
 ```
+
+Two mounts, one namespace, and the second one is why: `SkillsMiddleware`
+advertises a path and tells the model to `read_file` it, so a skill has to live
+in the same filesystem the explorer already reads from. Its route is read-only
+because `./skills` is inside this git repository — see
+[decision 10](#thirteen-decisions-that-are-the-architecture).
 
 `guide.md` is the newer of the two handoffs and the more interesting one, because
 the agent on the receiving end is a plain function. A file is the only channel a
@@ -442,6 +457,7 @@ which is why the prompts state them:
 | Every explorer gets a **different** path | Saving replaces a file, so the second explorer to finish erases the first |
 | Paths start with `/` and never contain `workspace` | The write succeeds into a folder *inside* the workspace that nobody reads |
 | The doc-writer saves to `/guide.md`; the orchestrator briefs the checker with that same path | The checker finds no guide — and a check with nothing to check must never read as a clean one |
+| A `SKILL.md`'s `name` equals its directory name | `SkillsMiddleware` skips a skill whose frontmatter breaks the specification, without raising. The skill simply never loads, and the run looks entirely normal |
 
 The third is not hypothetical — see
 [failure modes](#failure-modes-we-have-actually-seen) — and the fourth is pinned
@@ -450,10 +466,10 @@ by `tests/test_wiring.py`, which asserts that both prompts and
 
 ---
 
-## Eleven decisions that are the architecture
+## Thirteen decisions that are the architecture
 
-Everything above reduces to about eleven lines of code. Each one is here because
-the obvious alternative fails in a specific way.
+Everything above reduces to about thirteen lines of code. Each one is here
+because the obvious alternative fails in a specific way.
 
 **In `agent.py`:**
 
@@ -467,14 +483,16 @@ the obvious alternative fails in a specific way.
 | 6 | `RestrictToolsMiddleware()` **last** in the middleware list | It must run *after* the middleware that inject tools, or there is nothing to remove |
 | 7 | `register_harness_profile(…enabled=False)` | Deletes the library's default `general-purpose` sub-agent, which is advertised as having "all tools as the main agent" — now meaning *none* |
 | 8 | `"runnable": build_link_checker(backend)` instead of a prompt and tools | The one delegate with no model. Give it a system prompt "for flexibility" and a check that was arithmetic becomes an opinion — still shaped like a verdict, occasionally wrong, undetectably |
+| 9 | `"skills": [SKILLS_MOUNT]` on the **explorer only** | Ecosystem knowledge is for the agent choosing which files to open. On any other agent it is advice it cannot act on, charged per turn |
+| 10 | `CompositeBackend(default=workspace, routes={"/skills/": ReadOnlyBackend(...)})` | `SkillsMiddleware` advertises a path and tells the model to `read_file` it, so skills must live in the *same* filesystem the explorer reads. Read-only because `./skills` is inside the git repo — without it an explorer can write over the instructions it is following |
 
 **In `models.py`:**
 
 | # | Code | Why |
 |---|---|---|
-| 9 | `rate_limiter=…` on the **single** model instance | Sub-agents inherit the instance, so every agent that thinks draws from one bucket. The provider's limit is per project, not per agent — private limiters would spend the budget several times over |
-| 10 | `ChatGoogleGenerativeAI`, not the OpenAI-compatible endpoint | Gemini 3 models emit an encrypted `thought_signature` with every tool call that must be sent back verbatim. The compatibility layer drops it and turn 2 of any tool loop fails |
-| 11 | `ask()` returns `.text`, not `.content` | Gemini fills `content` with typed blocks; printing it dumps a data structure instead of prose. `.text` works for both providers |
+| 11 | `rate_limiter=…` on the **single** model instance | Sub-agents inherit the instance, so every agent that thinks draws from one bucket. The provider's limit is per project, not per agent — private limiters would spend the budget several times over |
+| 12 | `ChatGoogleGenerativeAI`, not the OpenAI-compatible endpoint | Gemini 3 models emit an encrypted `thought_signature` with every tool call that must be sent back verbatim. The compatibility layer drops it and turn 2 of any tool loop fails |
+| 13 | `ask()` returns `.text`, not `.content` | Gemini fills `content` with typed blocks; printing it dumps a data structure instead of prose. `.text` works for both providers |
 
 ---
 
@@ -603,9 +621,11 @@ forever while checking nothing.
 ```console
 $ uv run pytest tests/test_wiring.py -q      # 18 tests · ~1s · ZERO AI calls
 $ uv run pytest tests/test_citations.py -q   # 24 tests · does the checker catch a fake path?
+$ uv run pytest tests/test_skills.py -q      # 12 tests · are the skills found and unwritable?
 $ uv run pytest tests/test_tools.py -q       # 26 tests · live GitHub, no mocking
 $ uv run pytest tests/test_evals.py -q       # 37 tests · is the eval set itself true?
 $ uv run scripts/prove_link_checker.py       # the phase-6 proof, with a real doc-writer
+$ uv run scripts/show_skills.py              # the phase-7 proof, Python then JS
 $ uv run scripts/show_contexts.py            # one real run, per-agent tokens
 $ uv run scripts/run_evals.py                # six repos, one score
 $ uv run scripts/run_evals.py --score-only   # re-score recorded runs, free
@@ -690,6 +710,36 @@ model and a fingerprint of all three prompts, and a record whose fingerprint no
 longer matches the prompts on disk is reported as stale — because the failure
 this instrument invites is editing a prompt, re-scoring without re-running, and
 reading an unchanged number as evidence the edit was neutral.
+
+### The skills, and which one was read
+
+```console
+$ uv run scripts/show_skills.py
+```
+
+Two mappings back to back — a Python repository then a JavaScript one — with no
+code change between them, reporting which `SKILL.md` each run's explorers opened.
+
+That is the measurement, and it needs no interpretation. Progressive disclosure
+means the explorer is shown one line per skill and reads the full file only if it
+decides the repository matches, so its `read_file` calls state which ecosystem
+the system concluded it was in — and, more usefully, which one it concluded it was
+*not* in. A run that opened both skills would have demonstrated thoroughness
+rather than selection, and the script grades it as `PARTIAL` for exactly that
+reason.
+
+The observed result is a clean split: `psf/requests` read `python-repo` and never
+`node-repo`; `chalk/chalk` did the reverse. The guides carry the difference — the
+`chalk` one describes vendored dependencies reached through *subpath imports
+declared in `package.json`*, which no prompt in this project mentions and
+`skills/node-repo/SKILL.md` does.
+
+Two honest qualifications. Skill selection is a model decision, so a pass is a
+result rather than a guarantee; when no skill is read at all the script reports
+`INCONCLUSIVE`, because "the explorer ignored the index" is a prompt-adherence
+finding worth recording rather than a failure to hide. And that run used
+`gemini-3.1-flash-lite` rather than the usual Lite model, whose daily quota was
+spent — the script prints the model for precisely this reason.
 
 ### The trace
 
@@ -815,10 +865,14 @@ than letting the model invent them.
 **Three explorers is a hard ceiling**, and it is a budget rather than a design
 preference. A fourth does not make a run better; it makes it die part way through.
 
-**No skills yet.** What to look for differs by ecosystem — `pyproject.toml` and
-`tests/` for Python, `package.json` and `src/` for Node. Right now that knowledge is
-spread through the prompts. Phase 7 moves it into per-ecosystem files loaded only
-when relevant.
+**Skill selection is a model decision, and only two ecosystems are covered.** The
+explorer is shown one line per skill and chooses whether to open one; nothing
+forces it. Observed runs pick correctly and read only the matching file, but that
+is a result rather than a guarantee — `scripts/show_skills.py` reports
+`INCONCLUSIVE` rather than a pass when no skill is read, because "the explorer
+ignored the index" is a finding, not a bug to hide. A repository in a third
+language gets the generic instructions, which is the intended fallback: adding
+Go or Rust is a new `SKILL.md` and no code.
 
 ---
 
@@ -837,6 +891,6 @@ credited with the change it caused. See
 | 4b | Parallel fan-out | Done — trace verified |
 | 5 | Measurable regressions (eval set) | Done |
 | 6 | Sub-agents ≠ smaller AI calls (link-checker) | Done |
-| 7 | Prompt decomposition (skills) | Next |
-| 8 | Approval gates | Planned |
+| 7 | Prompt decomposition (skills) | Done |
+| 8 | Approval gates | Next |
 | 9 | Packaging | Planned |
