@@ -22,3 +22,9 @@ wheels/
 # Run output, not source — regenerated on every run.
 tmp/
 workspace/
+
+# Recorded eval runs. Each file is a log of guides the agent produced for one
+# case, written by scripts/run_evals.py and re-scored for free by --score-only.
+# Machine-local by design: they are measurements of one machine's runs against
+# one model, and committing them would invite reading a stale number as current.
+tests/evals/results/

@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from repo_cartographer.tools import (
     GitHubError,
+    _get,
     _headers,
     get_file_contents,
     get_repo_scopes,
@@ -128,12 +129,14 @@ def _probe_quota() -> dict[str, int]:
     from a rejected credential (a reason to fail): a 401 carries no
     X-RateLimit-* headers at all, which would otherwise read as -1 remaining
     and quietly skip the suite over what is really a broken token.
+
+    Goes through tools._get rather than requests.get so it inherits the same
+    retry the tools have carried since Phase 5. It used to call requests.get
+    directly and was, after that change, the last thing in the suite that a
+    single dropped connection could fail — which is a bad property in a helper
+    two tests call and a session fixture depends on.
     """
-    response = requests.get(
-        f"https://api.github.com/repos/{TINY_OWNER}/{TINY_REPO}",
-        headers=_headers(),
-        timeout=10,
-    )
+    response = _get(f"https://api.github.com/repos/{TINY_OWNER}/{TINY_REPO}")
     return {
         "status": response.status_code,
         "limit": int(response.headers.get("x-ratelimit-limit", -1)),
@@ -156,7 +159,10 @@ def require_api_budget() -> None:
     floor = int(os.environ.get("PHASE1_MIN_BUDGET", "20"))
     try:
         quota = _probe_quota()
-    except (requests.RequestException, ValueError) as exc:
+    except (GitHubError, requests.RequestException, ValueError) as exc:
+        # GitHubError since Phase 5: an unreachable API now surfaces as one,
+        # after the retry in tools._get has given up. Still an environment
+        # problem, so it still skips.
         pytest.skip(f"cannot reach the GitHub API: {exc}")
     if quota["status"] == 401:
         pytest.fail(

@@ -2,9 +2,9 @@
 
 The whole of the system's access to a repository, and deliberately free of any
 LLM or agent code — four ordinary functions over the GitHub REST API, testable
-on their own. Every failure mode raises `GitHubError` (the API said no) or
-`ValueError` (the argument pointed somewhere unreadable), so a caller can tell
-an API problem from a bad path.
+on their own. Every failure mode raises `GitHubError` (the API said no, or could
+not be reached at all) or `ValueError` (the argument pointed somewhere
+unreadable), so a caller can tell an API problem from a bad path.
 
 The functions are not all handed to the same agent, and the line between them is
 deliberate: `get_repo_scopes` reports a repository's *shape* — how many top-level
@@ -15,6 +15,7 @@ explorers without being able to do the work itself. See `agent.py`.
 
 import base64
 import os
+import time
 from urllib.parse import quote
 
 import requests
@@ -26,14 +27,22 @@ load_dotenv()
 # with an empty content field rather than an error.
 _MAX_INLINE_BYTES = 1_000_000
 
+# How long to wait on one attempt, how many attempts, and how long between them.
+# Three attempts with a growing pause covers the failure this exists for — a
+# connection dropped or a response that never arrives — without turning a real
+# outage into a two-minute hang.
+_TIMEOUT_SECONDS = 30
+_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 2
+
 
 class GitHubError(Exception):
-    """GitHub answered, but not with what was asked for.
+    """GitHub answered, but not with what was asked for — or did not answer.
 
     One type for every "the API said no" case — a rejected request, a tree it
-    would not return whole. Callers that need to tell an API problem from a bad
-    argument can catch this instead of a bare Exception; bad arguments raise
-    ValueError.
+    would not return whole, a connection that never completed. Callers that need
+    to tell an API problem from a bad argument can catch this instead of a bare
+    Exception; bad arguments raise ValueError.
     """
 
 
@@ -48,6 +57,47 @@ def _headers() -> dict[str, str]:
     if token := os.environ.get("GITHUB_TOKEN"):
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _get(url: str) -> requests.Response:
+    """GET a GitHub URL, retrying transport failures and only those.
+
+    Added at Phase 5, because the eval set immediately found what single runs had
+    hidden: four of six repositories failed a sweep on `ReadTimeout` and
+    `RemoteDisconnected` — the connection dropping, not GitHub answering. That is
+    the value of a fixed set run end to end, and it is worth naming as the first
+    thing it caught.
+
+    Two decisions here, and both are about which failures are *information*:
+
+    **Only transport errors are retried, never an HTTP answer.** A 404 is not
+    going to become a 200, and a 403 from the search quota gets worse if you ask
+    again. `requests` raises for the first kind and returns a response for the
+    second, so the distinction is the `except` clause and nothing more.
+
+    **A retry that runs out raises `GitHubError`,** which matters more than it
+    looks. Every failure this module already knows about — a rejected request, a
+    directory passed as a file — surfaces as `GitHubError` or `ValueError`, and
+    those reach the model as a tool error it can read and route around; the
+    prompts tell it exactly that ("a failed tool call is information"). A raw
+    `requests.ReadTimeout` did not: it escaped the agent loop and ended the run.
+    A dropped connection is now the same kind of event as a 404 — a fact about
+    one call, not the end of the job.
+    """
+    last: requests.RequestException | None = None
+    for attempt in range(_ATTEMPTS):
+        try:
+            return requests.get(url, headers=_headers(), timeout=_TIMEOUT_SECONDS)
+        except requests.RequestException as exc:
+            last = exc
+            if attempt + 1 < _ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
+
+    raise GitHubError(
+        f"Could not reach the GitHub API after {_ATTEMPTS} attempts: {last}. "
+        "This is a network problem rather than a bad request — the same call may "
+        "well work later, but do not repeat it immediately."
+    ) from last
 
 
 def get_repo_tree(owner: str, repo: str, ref: str = "HEAD") -> list[str]:
@@ -69,10 +119,11 @@ def get_repo_tree(owner: str, repo: str, ref: str = "HEAD") -> list[str]:
         list[str]: Repo-relative paths of every file in the tree.
 
     Raises:
-        GitHubError: if GitHub rejects the request, or truncated the tree.
+        GitHubError: if GitHub rejects the request, cannot be reached, or
+            truncated the tree.
     """
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
-    response = requests.get(url, headers=_headers(), timeout=30)
+    response = _get(url)
 
     if response.status_code != 200:
         raise GitHubError(f"Failed to fetch repository tree: {response.status_code} - {response.text}")
@@ -114,7 +165,8 @@ def get_repo_scopes(owner: str, repo: str, ref: str = "HEAD") -> list[dict]:
             sorted by file count descending then by name.
 
     Raises:
-        GitHubError: if GitHub rejects the request, or truncated the tree.
+        GitHubError: if GitHub rejects the request, cannot be reached, or
+            truncated the tree.
     """
     # Built on get_repo_tree rather than a second endpoint so both see exactly the
     # same repository: one source of truth for which paths exist, and the
@@ -143,12 +195,13 @@ def get_file_contents(owner: str, repo: str, path: str) -> str:
         str: The contents of the file as a string.
 
     Raises:
-        GitHubError: if GitHub rejects the request (a missing path answers 404).
+        GitHubError: if GitHub rejects the request (a missing path answers 404)
+            or cannot be reached.
         ValueError: if the path is not a readable UTF-8 text file — a directory,
             a symlink or submodule, a binary blob, or larger than 1MB.
     """
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    response = requests.get(url, headers=_headers(), timeout=30)
+    response = _get(url)
 
     if response.status_code != 200:
         raise GitHubError(f"Failed to fetch file contents: {response.status_code} - {response.text}")
@@ -219,16 +272,16 @@ def search_code(owner: str, repo: str, query: str) -> list[dict]:
             No matches is an empty list, not an error.
 
     Raises:
-        GitHubError: if GitHub rejects the request. The search endpoint has its
-            own quota — 30 requests/minute authenticated — and answers 403 when
-            it is spent.
+        GitHubError: if GitHub rejects the request or cannot be reached. The
+            search endpoint has its own quota — 30 requests/minute
+            authenticated — and answers 403 when it is spent.
     """
     # The query is percent-encoded: it travels inside a URL, so a raw space,
     # '&', '#' or '+' would truncate it or change its meaning. GitHub decodes
     # the parameter before parsing it, so qualifiers a caller passes in
     # (e.g. "language:python") still work encoded.
     url = f"https://api.github.com/search/code?q={quote(query, safe='')}+repo:{owner}/{repo}"
-    response = requests.get(url, headers=_headers(), timeout=30)
+    response = _get(url)
 
     if response.status_code != 200:
         raise GitHubError(f"Failed to search code: {response.status_code} - {response.text}")

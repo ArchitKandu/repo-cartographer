@@ -169,13 +169,14 @@ actually *says* has to come back from an explorer.
                     the org chart — the ONLY file
                    that imports the other four
                                  │
-          ┌──────────────────────┼──────────────────────┐
-          ▼                      ▼                      ▼
-       main.py         scripts/show_contexts.py   tests/test_wiring.py
-        (CLI)             (measures a run)         (asserts the org chart)
+      ┌───────────────┬──────────┴──────────┬────────────────────┐
+      ▼               ▼                     ▼                    ▼
+   main.py     show_contexts.py       run_evals.py        test_wiring.py
+    (CLI)      (measures a run)       (scores six)     (asserts the org chart)
 
    __init__.py ───────► tools.py only, never agent.py
    tests/test_tools.py ► tools.py only
+   tests/test_evals.py ► tools.py + tests/evals/, never agent.py
 ```
 
 **The shape is the point.** The four modules on the top row import *nothing* from
@@ -203,7 +204,7 @@ get_repo_scopes(owner, repo, ref="HEAD") -> list[dict]   # shape only
 
 The split between the first three and the last is load-bearing: the first three
 read what a repository **says**, the last reports only its **shape**. Only the last
-goes to the orchestrator. Two details worth knowing:
+goes to the orchestrator. Three details worth knowing:
 
 - **Directories are filtered out** of `get_repo_tree`. GitHub's tree API also lists
   directories and submodules, neither of which `get_file_contents` can read —
@@ -211,6 +212,12 @@ goes to the orchestrator. Two details worth knowing:
 - **A truncated tree raises** rather than returning a partial list. GitHub caps a
   recursive tree and flags the cut; a partial list that *looks* complete would make
   every downstream claim quietly wrong.
+- **Transport failures are retried, HTTP answers never are.** All four functions
+  go through one helper that retries a dropped or timed-out connection three
+  times and then raises `GitHubError` — while a 404 or a 403 is returned to the
+  caller immediately, because neither improves by asking again. Added at Phase 5;
+  see [failure modes](#failure-modes-we-have-actually-seen) for what it cost to
+  find.
 
 ---
 
@@ -450,8 +457,10 @@ contexts — not wall-clock speed.** That is the honest claim for the fan-out.
 
 ## Failure modes we have actually seen
 
-All three are the same shape, and it is the shape worth remembering: **in a
+The first two are the same shape, and it is the shape worth remembering: **in a
 delegated system, things do not fail loudly. They succeed somewhere useless.**
+The last two are a different lesson, and it is Phase 5's: **a bug that only
+appears on some runs is invisible to a person watching some runs.**
 
 **1 · The run died on a rate limit.** The first fan-out attempt:
 
@@ -471,7 +480,27 @@ storage root, so the write created a second folder inside it. The write succeede
 The explorer reported success. Nothing errored. The doc-writer would simply have
 found an empty cabinet. Both prompts now state the path rule explicitly.
 
-**3 · A test that could never have passed.** While writing the check that the
+**3 · One dropped packet ended a whole mapping.** The first full eval sweep failed
+four of six repositories:
+
+```
+[1/6] requests (psf/requests) … FAILED after 77.4s — ReadTimeout: api.github.com
+[4/6] httpx (encode/httpx) …    FAILED after 101.0s — ConnectionError: RemoteDisconnected
+```
+
+Not the model, not a rate limit — the connection to GitHub dropping. The reason it
+was fatal is an asymmetry four phases of single runs never surfaced: `GitHubError`
+and `ValueError` from the tools layer reach the model as a tool error it can read
+and route around, exactly as the prompts promise, but a raw `requests.ReadTimeout`
+escaped the agent loop and ended the run. `tools.py` now retries transport
+failures — and only transport failures, never an HTTP answer — then raises
+`GitHubError`, so a dropped connection is the same kind of event as a 404. Same
+four cases, unchanged, on the retry: 5/5, 3/5, 5/5, 6/6.
+
+The point is not the bug. It is that the bug survived every phase in which
+verification meant watching a run, and died in the first sweep of a fixed set.
+
+**4 · A test that could never have passed.** While writing the check that the
 default `general-purpose` sub-agent was gone, the obvious assertion was *"the word
 `general-purpose` does not appear in the tool description."* It failed — because
 the description's fixed usage notes mention that name whether the agent is enabled
@@ -486,7 +515,10 @@ forever while checking nothing.
 ```console
 $ uv run pytest tests/test_wiring.py -q      # 16 tests · ~1s · ZERO AI calls
 $ uv run pytest tests/test_tools.py -q       # 26 tests · live GitHub, no mocking
+$ uv run pytest tests/test_evals.py -q       # 37 tests · is the eval set itself true?
 $ uv run scripts/show_contexts.py            # one real run, per-agent tokens
+$ uv run scripts/run_evals.py                # six repos, one score
+$ uv run scripts/run_evals.py --score-only   # re-score recorded runs, free
 $ uv run main.py "your question here"        # just use it
 ```
 
@@ -504,6 +536,61 @@ anywhere**. So it is asserted mechanically, in a second, for free.
 - **Compiled-graph level** — did the library honour any of it? This one reaches into
   private structure, so it is the test most likely to break on an upgrade. If it
   does, that is a signal worth reading, not a test worth deleting.
+
+### The eval set
+
+Everything above this line was verified by looking — once, on one run, by a human
+reading a transcript. That is enough to establish a mechanism exists and not
+enough to notice when it stops working. Phase 5 fixes six repositories, writes
+down the facts a good guide about each should contain, and prints one number:
+
+```console
+$ uv run scripts/run_evals.py
+
+case        repo                    facts  present  missing
+-----------------------------------------------------------
+requests    psf/requests                5        5  —
+flask       pallets/flask               5        5  —
+click       pallets/click               5        3  types-module, parser-module
+httpx       encode/httpx                5        5  —
+express     expressjs/express           6        6  —
+chalk       chalk/chalk                 5        5  —
+-----------------------------------------------------------
+total                                  31       29
+
+29 of 31 expected facts present (94%)
+```
+
+The two misses are readable rather than mysterious: mapping `pallets/click`, the
+explorers covered `core.py` and `decorators.py` and never opened `types.py` or
+`parser.py`, so the guide could not mention them. That is the scope-coverage
+question the [known limitations](#known-limitations) could previously only
+describe anecdotally, now attached to a number that moves.
+
+The dataset is `tests/evals/known_repos.jsonl` — six cases, thirty-one facts, each
+fact either a repo-relative **path** or a **term** that really occurs in a named
+file. Nothing is graded by a model. A path either appears in the guide or it does
+not, which is what keeps the number from drifting when nobody changed anything.
+
+Two properties are worth knowing before quoting it:
+
+- **It scores recall of citations, not quality.** A guide naming every expected
+  file and describing all of them wrongly scores full marks. What the number is
+  for is *movement* — same dataset, same questions, before and after a change.
+- **The dataset is verified against the live repositories**, by
+  `tests/test_evals.py`, with no model involved. This is not bookkeeping: the
+  first draft expected `lib/router/index.js` from `expressjs/express`, a path
+  every account of Express describes and which the repository has not had since
+  routing moved to its own package. Unverified, that would have scored as a miss
+  on every run forever — and read as the agent's failure rather than the
+  dataset's.
+
+Recorded runs go to `tests/evals/results/` as a growing log, so `--score-only`
+re-scores them against the current dataset for free. Each record carries the
+model and a fingerprint of all three prompts, and a record whose fingerprint no
+longer matches the prompts on disk is reported as stale — because the failure
+this instrument invites is editing a prompt, re-scoring without re-running, and
+reading an unchanged number as evidence the edit was neutral.
 
 ### The trace
 
@@ -551,10 +638,25 @@ Severity varies. In one run the root explorer cost *more* than the `src` explore
 twice and paid for twice. In the traced run it stayed proportionate (30,595 against
 87,689, matching the 8-vs-42 file split), but it still crossed the line.
 
-That variability is the real problem. A rule followed most of the time cannot be
-verified by looking at one run, which is exactly the argument for Phase 5: an eval
-set turns "it seemed fine when I looked" into a number that moves when you change a
-prompt.
+That variability is the real problem, and it is what Phase 5 exists to answer. A
+rule followed most of the time cannot be verified by looking at one run; the eval
+set turns "it seemed fine when I looked" into a number that moves when you change
+a prompt. It does not fix scope drift — it makes the cost of the drift, in facts
+the guide ends up missing, something you can watch. Both of the eval's current
+misses are that cost: mapping `pallets/click`, nobody opened `types.py` or
+`parser.py`, so the guide could not mention them. Coverage, not accuracy.
+
+**The workspace is shared between runs, and that is a real hazard.** `./workspace`
+is one directory, not one per run, so the notes from the last question are still
+sitting there when you ask the next one — and `DOC_WRITER_PROMPT` deliberately
+tells the doc-writer to `ls` and read what it finds rather than trusting the
+brief's list. Ask about `psf/requests`, then about `pallets/flask`, and flask's
+doc-writer can open a notes file full of `requests`. Nothing errors. It is the
+same shape as every other failure in this section: it succeeds somewhere useless.
+`scripts/run_evals.py` empties the workspace between cases for exactly this
+reason, which contains the problem for the eval and not for anyone typing two
+`main.py` commands in a row. A per-run workspace is the actual fix and has not
+been made.
 
 **The guide can still repeat an explorer's mistake.** The doc-writer cannot invent a
 path, but it will faithfully reproduce a wrong one. Verifying cited paths against
@@ -588,8 +690,8 @@ credited with the change it caused. See
 | 3 | Context offloading | Done |
 | 4a | Context quarantine | Done |
 | 4b | Parallel fan-out | Done — trace verified |
-| 5 | Measurable regressions (eval set) | Next |
-| 6 | Sub-agents ≠ smaller AI calls (link-checker) | Planned |
+| 5 | Measurable regressions (eval set) | Done |
+| 6 | Sub-agents ≠ smaller AI calls (link-checker) | Next |
 | 7 | Prompt decomposition (skills) | Planned |
 | 8 | Approval gates | Planned |
 | 9 | Packaging | Planned |

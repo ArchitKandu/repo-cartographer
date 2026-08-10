@@ -30,7 +30,8 @@ reasoning behind the ordering.
 | 3 | Filesystem backend | Done |
 | 4a | Explorer + doc-writer sub-agents | Done |
 | 4b | Parallel fan-out per directory | **Done — trace verified, this is what runs today** |
-| 5+ | Evals, link-checker, skills | Planned |
+| 5 | Eval set: six repos, one score | Done |
+| 6+ | Link-checker, skills, approval gates | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
 tool before calling any of yours, unprompted"* — is met. On `psf/requests` with
@@ -180,12 +181,104 @@ prompts now state the path rule explicitly, because this is the shape of every
 handoff bug in a delegated system: it does not fail, it succeeds somewhere
 useless.
 
+### Phase 5: a number instead of an impression
+
+Everything above was verified by looking — once, on one run, by a human reading a
+transcript. That establishes a mechanism exists; it does not notice when the
+mechanism stops working. So Phase 5 fixes six repositories, writes down the facts
+a good guide about each one should contain, and prints a single number:
+
+```console
+$ uv run scripts/run_evals.py
+
+case        repo                    facts  present  missing
+-----------------------------------------------------------
+requests    psf/requests                5        5  —
+flask       pallets/flask               5        5  —
+click       pallets/click               5        3  types-module, parser-module
+httpx       encode/httpx                5        5  —
+express     expressjs/express           6        6  —
+chalk       chalk/chalk                 5        5  —
+-----------------------------------------------------------
+total                                  31       29
+
+29 of 31 expected facts present (94%)
+```
+
+Six repositories, four Python and two JavaScript, chosen small enough to map in a
+few minutes each and stable enough that the facts stay true. The two misses are
+real and readable: mapping `pallets/click`, the explorers covered `core.py` and
+`decorators.py` and never opened `types.py` or `parser.py`, so the guide could not
+mention them. That is the scope-coverage question Phase 4 could only describe
+anecdotally, now attached to a number.
+
+**Nothing here is graded by a model.** Every fact is either a repo-relative path
+or a term that really occurs in a named file, matched against the guide with
+markdown stripped and word edges respected. A model-graded eval would measure a
+second model's judgement as much as this system's output and move when nobody
+changed anything; a path either appears or it does not.
+
+**The eval set is itself verified, against the live repositories.**
+`tests/test_evals.py` checks that every expected path exists and every expected
+term really occurs in the file that claims it — no model involved. This is not
+bookkeeping. The first draft of the dataset expected `lib/router/index.js` from
+`expressjs/express`: a path every account of Express describes, and which the
+repository has not contained since routing moved out to its own package.
+Unverified, it would have scored as a miss on every run forever, and read as the
+agent's failure rather than the dataset's.
+
+**Two honest caveats.** The score is *recall of citations*, not quality — a guide
+naming every expected file and explaining all of them wrongly scores 31 of 31.
+And it is one sample per case; the agent chooses which files to open, and that
+choice differs between runs of an unchanged system, so a two-point move is not a
+regression. `--history` shows every run recorded so far, which is where the noise
+floor becomes visible instead of assumed.
+
+Recorded guides live in `tests/evals/results/` as a growing log, so `--score-only`
+re-scores them against the current dataset instantly and for free — editing a
+fact or adding a case costs no model quota, only changing the agent does. Each
+record carries the model and a fingerprint of all three prompts, and any record
+whose fingerprint no longer matches the prompts on disk is flagged as stale.
+That is the specific way this instrument could mislead: rewrite a prompt,
+re-score without re-running, and read an unchanged number as evidence the
+rewrite was neutral.
+
+#### The first thing it caught was not the agent
+
+The first full sweep failed four of six cases:
+
+```
+[1/6] requests (psf/requests) … FAILED after 77.4s — ReadTimeout: api.github.com
+[3/6] click (pallets/click) …   FAILED after 193.8s — ReadTimeout: api.github.com
+[4/6] httpx (encode/httpx) …    FAILED after 101.0s — ConnectionError: RemoteDisconnected
+[5/6] express (expressjs/express) … FAILED after 85.9s — ReadTimeout: api.github.com
+```
+
+Not the model, and not a rate limit — the connection to GitHub dropping. What
+made it fatal was an asymmetry nobody had noticed in four phases of single runs:
+a `GitHubError` or `ValueError` from the tools layer reaches the model as a tool
+error it can read and route around, exactly as the prompts promise ("a failed
+tool call is information"), but a raw `requests.ReadTimeout` escaped the agent
+loop and ended the run. One dropped packet, and a whole mapping was gone.
+
+[`tools.py`](repo_cartographer/tools.py) now routes every call through one
+helper that retries transport failures three times with a growing pause — and
+only transport failures, never an HTTP answer, because a 404 will not become a
+200 and a 403 from the search quota gets worse if you ask again. When the retries
+run out it raises `GitHubError`, so a dropped connection is now the same kind of
+event as a 404: a fact about one call, not the end of the job. Re-running the
+same four cases unchanged: 5/5, 3/5, 5/5, 6/6.
+
+A bug that survives four phases of watching runs and dies in the first sweep of a
+fixed set is the argument for the phase, made better than any claim about it
+would have been.
+
 What works right now: an orchestrator that sizes a repository up and splits it
 across up to three explorers, explorers that read one directory each and take
 notes, and a doc-writer that turns those notes into a guide
 with an architecture overview, a where-things-happen table, and an explicit list
-of what went unread. Still ahead: the eval set (Phase 5), citation checking
-(Phase 6), skills (Phase 7). Paths in the guide carry three prompts' instruction
+of what went unread. Still ahead: citation checking (Phase 6), skills (Phase 7).
+Paths in the guide carry three prompts' instruction
 to cite only verified ones, plus one structural guarantee — the doc-writer has no
 GitHub access, so it cannot describe a file nobody read. It can still repeat an
 explorer's mistake, and catching that is Phase 6's job.
@@ -319,8 +412,13 @@ LLM or agent code. It's ordinary, testable Python:
 | `get_file_contents(owner, repo, path)` | The file as a UTF-8 string | Decodes GitHub's base64 for you. Refuses directories, symlinks, binaries, and files over 1 MB with a message naming the actual problem. |
 | `search_code(owner, repo, query)` | Matching results | URL-escapes the query and scopes it to the one repo. No matches is an empty list, not an error. |
 
-Every failure mode raises `GitHubError` (the API said no) or `ValueError` (the
-argument pointed somewhere unreadable), so a caller can tell the two apart.
+Every failure mode raises `GitHubError` (the API said no, or could not be reached
+at all) or `ValueError` (the argument pointed somewhere unreadable), so a caller
+can tell the two apart. All four go through one helper that retries a dropped or
+timed-out connection three times — and only that, never an HTTP answer, since a
+404 will not become a 200 and a 403 from the search quota gets worse if you ask
+again. Phase 5 is where that turned out to matter; see
+[the first thing it caught](#the-first-thing-it-caught-was-not-the-agent).
 
 ---
 
@@ -443,8 +541,11 @@ them; configure one and it is used automatically.
 uv run pytest
 ```
 
-Expect `20 passed, 1 deselected`. These tests hit the real GitHub API with no
-mocking, so a pass means your token works and the tools genuinely function.
+Expect `79 passed, 1 deselected`. These tests hit the real GitHub API with no
+mocking, so a pass means your token works and the tools genuinely function. No
+model is called anywhere in the suite, so it costs nothing against your provider
+quota. A few tests skip themselves rather than fail if GitHub is unreachable or
+your hourly quota is spent — an environment problem is not a bug in the code.
 
 ---
 
@@ -543,10 +644,17 @@ repo-cartographer/
 │   └── tools.py         Four GitHub API functions — no LLM code
 ├── scripts/
 │   ├── measure_context.py   Phase 3's A/B: offloading on vs. off
-│   └── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
+│   ├── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
+│   └── run_evals.py         Phase 5: six repos in, one score out
 ├── tests/
 │   ├── test_tools.py    Live tests against the real GitHub API
-│   └── test_wiring.py   The three-way split, asserted without a model
+│   ├── test_wiring.py   The three-way split, asserted without a model
+│   ├── test_evals.py    Is the eval set itself true? (live GitHub, no model)
+│   └── evals/
+│       ├── known_repos.jsonl   The dataset: 6 repos, 31 expected facts
+│       ├── dataset.py          Loads and validates it, strictly
+│       ├── scoring.py          Is this fact in this guide? No model involved
+│       └── results/            Recorded runs — git-ignored
 ├── workspace/           The agent's scratch space — git-ignored, run output
 ├── main.py              CLI: uv run main.py "your question"
 ├── .env.example         Template for your keys — copy to .env
@@ -589,6 +697,11 @@ uv run pytest -v --log-cli-level=INFO   # verbose, with live logs
 
 uv run scripts/measure_context.py               # Phase 3's A/B, 2 model runs
 uv run scripts/measure_context.py --repeats 3   # ...with ranges, 6 model runs
+
+uv run scripts/run_evals.py                     # Phase 5's score, 6 model runs
+uv run scripts/run_evals.py --case flask        # ...one repo only
+uv run scripts/run_evals.py --score-only        # re-score recorded runs, free
+uv run scripts/run_evals.py --history           # every run recorded so far
 ```
 
 `measure_context.py` spends real model quota — two runs per `--repeats`, each a
