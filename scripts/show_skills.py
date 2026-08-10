@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 # is run directly — pyproject's `pythonpath = ["."]` covers pytest, not this.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from repo_cartographer.agent import RECURSION_LIMIT, WORKSPACE, agent
+from repo_cartographer.agent import WORKSPACE, agent, run_config
 from repo_cartographer.skills import SKILLS_MOUNT, available_skills
 
 if TYPE_CHECKING:
@@ -130,7 +130,7 @@ def run_one(slug: str, expected: str) -> Run:
     try:
         for namespace, update in agent.stream(
             {"messages": [{"role": "user", "content": question}]},
-            config={"recursion_limit": RECURSION_LIMIT},
+            config=run_config(),
             subgraphs=True,
             stream_mode="updates",
         ):

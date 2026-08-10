@@ -51,6 +51,7 @@ a reason to edit this file.
 
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
 from deepagents.backends.protocol import BackendProtocol
@@ -61,9 +62,12 @@ from deepagents.profiles import (
     register_harness_profile,
 )
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
 from repo_cartographer.link_checker import (
+    DEFAULT_GUIDE_PATH,
     LINK_CHECKER_DESCRIPTION,
     build_link_checker,
 )
@@ -73,6 +77,10 @@ from repo_cartographer.prompts import (
     DOC_WRITER_PROMPT,
     EXPLORER_PROMPT,
     ORCHESTRATOR_PROMPT,
+)
+from repo_cartographer.pull_requests import (
+    PULL_REQUEST_TOOL,
+    build_pull_request_tool,
 )
 from repo_cartographer.skills import (
     HOUSE_STYLE_HEADER,
@@ -341,7 +349,7 @@ def build_agent(
         # contents, so it buys the orchestrator the ability to divide the work
         # without the ability to do it. Everything about what the code says still
         # has to come back from an explorer.
-        tools=[get_repo_scopes],
+        tools=[get_repo_scopes, build_pull_request_tool(backend, DEFAULT_GUIDE_PATH)],
         # Passed as plain functions inside the specs: LangChain derives each tool's
         # schema and description from its signature and docstring, so tools.py stays
         # the single source of truth for what the model knows about them.
@@ -353,6 +361,23 @@ def build_agent(
         # their specs set.
         backend=backend,
         middleware=middleware,
+        # Phase 8, and it is one line for the same reason a seatbelt is one
+        # buckle. `open_pull_request` is the only thing this system can do that
+        # cannot be undone, so the graph stops *before* it runs and hands the
+        # pending call back to whoever invoked it. Nothing resumes without an
+        # explicit decision.
+        #
+        # Note what is deliberately absent: no other tool is listed. A gate that
+        # asks about every read trains whoever is answering to approve without
+        # looking, which is how an approval step becomes a rubber stamp — and
+        # then the one call that mattered gets waved through with the rest.
+        interrupt_on={PULL_REQUEST_TOOL: True},
+        # Required for the interrupt above to be an interrupt rather than a
+        # crash: pausing means writing the run's state somewhere it can be picked
+        # up again, and `interrupt()` raises without a checkpointer to write to.
+        # In-memory because a paused run here is resumed seconds later by the same
+        # process; a deployment that survives a restart wants a real one.
+        checkpointer=InMemorySaver(),
     )
 
 
@@ -375,22 +400,85 @@ EXAMPLE_QUESTION = (
 RECURSION_LIMIT = 60
 
 
-def map_repo(question: str, cartographer: CompiledStateGraph | None = None) -> dict[str, Any]:
+def run_config(thread_id: str | None = None) -> RunnableConfig:
+    """The config every invocation of this graph needs, in one place.
+
+    `thread_id` became mandatory at Phase 8. A checkpointer is what makes an
+    interrupt a pause rather than a crash, and a checkpointer needs somewhere to
+    write — LangGraph raises without a thread. Every caller therefore needs one,
+    which is exactly the kind of requirement that gets forgotten in the fourth
+    script rather than the first, so there is one function rather than four
+    literals.
+
+    A fresh id per run by default. Reusing one would resume the previous
+    conversation, so two unrelated questions on a default thread would arrive as
+    a follow-up to each other. Pass an explicit id when you actually mean to
+    continue a run — which, for this system, means answering an approval.
+    """
+    return {
+        "configurable": {"thread_id": thread_id or str(uuid4())},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+
+
+def map_repo(
+    question: str,
+    cartographer: CompiledStateGraph | None = None,
+    *,
+    thread_id: str | None = None,
+) -> dict[str, Any]:
     """Run one mapping and return the final graph state.
 
     The whole state, not just the answer, because the message list is the subject
     of Phase 3's measurement — `scripts/measure_context.py` reads token usage off
     it. `ask` is the wrapper for callers who only want the prose.
+
+    Since Phase 8 the state may also come back *paused*, carrying `__interrupt__`
+    instead of a finished answer. That is a legitimate outcome, not an error —
+    see `ask` for why it must not be read as one.
     """
     return (cartographer or agent).invoke(
         {"messages": [{"role": "user", "content": question}]},
-        config={"recursion_limit": RECURSION_LIMIT},
+        config=run_config(thread_id),
     )
 
 
-def ask(question: str, cartographer: CompiledStateGraph | None = None) -> str:
+def pending_approval(state: dict[str, Any]) -> Any | None:
+    """The interrupt a paused run is waiting on, or `None` if it finished.
+
+    A run that stopped at the approval gate returns normally with an
+    `__interrupt__` key, which is the trap Phase 8 introduces: every caller that
+    reaches for `messages[-1]` gets the assistant's *tool call* and reads it as
+    an answer. Nothing raises. A paused run would look like a finished one that
+    happened to be brief.
+    """
+    interrupts = state.get("__interrupt__")
+    return interrupts[0] if interrupts else None
+
+
+def ask(
+    question: str,
+    cartographer: CompiledStateGraph | None = None,
+    *,
+    thread_id: str | None = None,
+) -> str:
     """Put one question to the cartographer and return its final answer as prose."""
-    result = map_repo(question, cartographer)
+    result = map_repo(question, cartographer, thread_id=thread_id)
+
+    if (interrupt := pending_approval(result)) is not None:
+        # Deliberately prose rather than an exception. `ask` returns what a human
+        # should read, and "I stopped because I need your permission" is a true
+        # and useful answer to a question. Raising would turn a working safety
+        # feature into a stack trace, and the caller most likely to hit this —
+        # someone typing `uv run main.py` — is exactly the person the pause is
+        # for. `scripts/prove_approval_gate.py` shows how to answer it.
+        return (
+            "PAUSED — waiting for your approval before doing something that "
+            f"cannot be undone.\n\n{interrupt.value}\n\nNothing has been sent "
+            "anywhere. Resume the run with a decision to continue, or abandon it "
+            "and nothing happens at all."
+        )
+
     # `.text`, not `.content`. Gemini fills `content` with a list of typed blocks —
     # the answer plus an encrypted thought signature in `extras` — so printing
     # `content` dumps a repr of that structure instead of the answer. OpenRouter

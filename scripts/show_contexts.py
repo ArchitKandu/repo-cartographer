@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, NamedTuple
 # pytest, not this.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from repo_cartographer.agent import EXAMPLE_QUESTION, RECURSION_LIMIT, agent
+from repo_cartographer.agent import EXAMPLE_QUESTION, agent, run_config
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -139,7 +139,9 @@ def run(question: str) -> tuple[list[Thread], str, list[int]]:
 
     for namespace, update in agent.stream(
         {"messages": [{"role": "user", "content": question}]},
-        config={"recursion_limit": RECURSION_LIMIT},
+        # Since Phase 8 the graph carries a checkpointer, so every invocation
+        # needs a thread to write to. `run_config` is the one place that knows.
+        config=run_config(),
         subgraphs=True,
         stream_mode="updates",
     ):

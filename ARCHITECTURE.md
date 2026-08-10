@@ -14,7 +14,7 @@ all.** Everything below is the detail of that sentence.
 - [The files, and how they connect](#the-files-and-how-they-connect)
 - [A real run, step by step](#a-real-run-step-by-step)
 - [The handoff contract](#the-handoff-contract)
-- [Thirteen decisions that are the architecture](#thirteen-decisions-that-are-the-architecture)
+- [Fifteen decisions that are the architecture](#fifteen-decisions-that-are-the-architecture)
 - [What it costs](#what-it-costs)
 - [Failure modes we have actually seen](#failure-modes-we-have-actually-seen)
 - [How to verify any of this](#how-to-verify-any-of-this)
@@ -111,7 +111,7 @@ flowchart TB
 
 | Agent | Can reach GitHub? | Can write? | Model? | Job |
 |---|---|---|---|---|
-| **orchestrator** | shape only — folder names and file counts | no | yes | Decide how to divide the repo, brief the others, verify their output, relay the guide |
+| **orchestrator** | shape only — folder names and file counts | only with a human's approval | yes | Decide how to divide the repo, brief the others, verify their output, relay the guide |
 | **explorer** (up to 3) | yes — tree, file contents, code search | yes, its own notes file | yes | Read one top-level directory and write down what is in it |
 | **doc-writer** | **no** | yes, the guide | yes | Turn the notes into the guide |
 | **link-checker** | the file tree only | no | **no** | Verify every path the guide cites actually exists |
@@ -466,9 +466,9 @@ by `tests/test_wiring.py`, which asserts that both prompts and
 
 ---
 
-## Thirteen decisions that are the architecture
+## Fifteen decisions that are the architecture
 
-Everything above reduces to about thirteen lines of code. Each one is here
+Everything above reduces to about fifteen lines of code. Each one is here
 because the obvious alternative fails in a specific way.
 
 **In `agent.py`:**
@@ -485,14 +485,16 @@ because the obvious alternative fails in a specific way.
 | 8 | `"runnable": build_link_checker(backend)` instead of a prompt and tools | The one delegate with no model. Give it a system prompt "for flexibility" and a check that was arithmetic becomes an opinion — still shaped like a verdict, occasionally wrong, undetectably |
 | 9 | `"skills": [SKILLS_MOUNT]` on the **explorer only** | Ecosystem knowledge is for the agent choosing which files to open. On any other agent it is advice it cannot act on, charged per turn |
 | 10 | `CompositeBackend(default=workspace, routes={"/skills/": ReadOnlyBackend(...)})` | `SkillsMiddleware` advertises a path and tells the model to `read_file` it, so skills must live in the *same* filesystem the explorer reads. Read-only because `./skills` is inside the git repo — without it an explorer can write over the instructions it is following |
+| 11 | `interrupt_on={PULL_REQUEST_TOOL: True}` — **one** tool, not a policy | The graph stops before the only irreversible call. Gate everything and whoever answers learns to approve without reading, and then the call that mattered is waved through with the rest |
+| 12 | `checkpointer=InMemorySaver()` | What makes an interrupt a pause rather than a crash. `interrupt()` needs somewhere to write the run's state; without it the safety path is the one that raises |
 
 **In `models.py`:**
 
 | # | Code | Why |
 |---|---|---|
-| 11 | `rate_limiter=…` on the **single** model instance | Sub-agents inherit the instance, so every agent that thinks draws from one bucket. The provider's limit is per project, not per agent — private limiters would spend the budget several times over |
-| 12 | `ChatGoogleGenerativeAI`, not the OpenAI-compatible endpoint | Gemini 3 models emit an encrypted `thought_signature` with every tool call that must be sent back verbatim. The compatibility layer drops it and turn 2 of any tool loop fails |
-| 13 | `ask()` returns `.text`, not `.content` | Gemini fills `content` with typed blocks; printing it dumps a data structure instead of prose. `.text` works for both providers |
+| 13 | `rate_limiter=…` on the **single** model instance | Sub-agents inherit the instance, so every agent that thinks draws from one bucket. The provider's limit is per project, not per agent — private limiters would spend the budget several times over |
+| 14 | `ChatGoogleGenerativeAI`, not the OpenAI-compatible endpoint | Gemini 3 models emit an encrypted `thought_signature` with every tool call that must be sent back verbatim. The compatibility layer drops it and turn 2 of any tool loop fails |
+| 15 | `ask()` returns `.text`, not `.content` | Gemini fills `content` with typed blocks; printing it dumps a data structure instead of prose. `.text` works for both providers |
 
 ---
 
@@ -548,10 +550,12 @@ contexts — not wall-clock speed.** That is the honest claim for the fan-out.
 
 ## Failure modes we have actually seen
 
-The first two are the same shape, and it is the shape worth remembering: **in a
-delegated system, things do not fail loudly. They succeed somewhere useless.**
-The last two are a different lesson, and it is Phase 5's: **a bug that only
-appears on some runs is invisible to a person watching some runs.**
+Three lessons run through these. The first two are the same shape, and it is the
+shape worth remembering: **in a delegated system, things do not fail loudly. They
+succeed somewhere useless.** The third is Phase 5's: **a bug that only appears on
+some runs is invisible to a person watching some runs.** And the last two are the
+one that keeps recurring: **an assertion can look like it is checking the system
+while it is checking the test.**
 
 **1 · The run died on a rate limit.** The first fan-out attempt:
 
@@ -606,7 +610,20 @@ error, because every path in a perfectly good guide would come back missing and
 the whole document would be condemned. Names are now trimmed at the ends only,
 since dots are legal inside a repository name.
 
-**6 · A test that could never have passed.** While writing the check that the
+**6 · A proof that failed while the thing it was proving worked.** The first run
+of `prove_approval_gate.py` printed `FAIL — the gate paused, but the decision did
+not change what happened`, and the gate was fine. The verdict asked whether the
+rejection branch's tool message contained the word "rejected" — but the script
+itself supplies the rejection text, and it had been customised to *"Not this
+time."* The check was testing its own literal.
+
+The fix is the more interesting part: the real question was never "does the
+message say rejected", it was **did the tool body run**, and the only honest
+signature for that is a string only `open_pull_request` itself produces. Same
+family as the next one — an assertion that looks like it is checking the system
+and is checking the test.
+
+**7 · A test that could never have passed.** While writing the check that the
 default `general-purpose` sub-agent was gone, the obvious assertion was *"the word
 `general-purpose` does not appear in the tool description."* It failed — because
 the description's fixed usage notes mention that name whether the agent is enabled
@@ -621,11 +638,13 @@ forever while checking nothing.
 ```console
 $ uv run pytest tests/test_wiring.py -q      # 18 tests · ~1s · ZERO AI calls
 $ uv run pytest tests/test_citations.py -q   # 24 tests · does the checker catch a fake path?
-$ uv run pytest tests/test_skills.py -q      # 12 tests · are the skills found and unwritable?
+$ uv run pytest tests/test_skills.py -q      # 13 tests · are the skills found and unwritable?
+$ uv run pytest tests/test_approval.py -q    # 16 tests · is the irreversible action gated?
 $ uv run pytest tests/test_tools.py -q       # 26 tests · live GitHub, no mocking
 $ uv run pytest tests/test_evals.py -q       # 37 tests · is the eval set itself true?
 $ uv run scripts/prove_link_checker.py       # the phase-6 proof, with a real doc-writer
 $ uv run scripts/show_skills.py              # the phase-7 proof, Python then JS
+$ uv run scripts/prove_approval_gate.py      # the phase-8 proof, pause / reject / approve
 $ uv run scripts/show_contexts.py            # one real run, per-agent tokens
 $ uv run scripts/run_evals.py                # six repos, one score
 $ uv run scripts/run_evals.py --score-only   # re-score recorded runs, free
@@ -741,6 +760,44 @@ finding worth recording rather than a failure to hide. And that run used
 `gemini-3.1-flash-lite` rather than the usual Lite model, whose daily quota was
 spent — the script prints the model for precisely this reason.
 
+### The approval gate
+
+```console
+$ uv run scripts/prove_approval_gate.py
+```
+
+One run, driven three ways: to the gate, then rejected, then replayed and
+approved. The phase's definition of done is deliberately not "the parameter is
+set", so what this reports is what the graph actually did.
+
+```
+1. running until the gate …
+   PAUSED. The graph stopped before the tool ran.
+   open_pull_request results so far: 0 — nothing has executed.
+
+2. resuming with a REJECTION …   [status=error]    Not this time.
+3. replaying and APPROVING …     [status=success]  Refused: opening pull requests is switched off. …
+
+   tool body ran on rejection: False   on approval: True
+```
+
+The last line is the measurement. A gate that pauses and then behaves identically
+whatever you answer is theatre — so the claim is not "it paused" but "the two
+answers produced different outcomes". The rejection reached the model as a
+synthetic tool message the tool never wrote; the approval reached the function
+body, whose own first act was to decline because the second guard was off.
+
+Which is what makes this demonstrable at all. Proving an approval gate works
+normally means approving something — and here that would mean opening a real pull
+request on someone else's repository to show that a safety feature functions.
+`ALLOW_PULL_REQUESTS` is what removes that dilemma, and the script refuses to
+start if it is set.
+
+Nothing in this repository has ever executed the network half of
+`open_pull_request`. That gap is deliberate and named rather than papered over;
+closing it honestly needs a throwaway repository someone owns, not a test suite
+that writes to other people's.
+
 ### The trace
 
 `LANGSMITH_TRACING=true` plus a key in `.env` records every run in LangSmith, with
@@ -851,6 +908,27 @@ off, and a checker that confidently condemns a correct guide is worse than no
 checker. The counts are reported either way, so the check's own margin of error is
 visible rather than implied.
 
+**The gate assumes somebody is there.** `interrupt_on` stops the agent acting
+alone; it does not make an unattended run safe, it makes it stop. That is the
+right default and it is also not a running feature — a scheduled deployment that
+wants pull requests needs a policy for answering, and this project has none.
+`ALLOW_PULL_REQUESTS` is the blunt instrument that covers the gap: off by
+default, so an unwatched run cannot act even if something approves for it.
+
+**Whether the agent asks is still a model decision.** The gate governs what
+happens once `open_pull_request` is called. Nothing forces the model to call it
+when a user asks, and nothing but the prompt stops it calling on a run where
+nobody asked. The first is a missing feature; the second is a real risk, which is
+why three rules in `ORCHESTRATOR_PROMPT` address it and a test asserts they are
+still there.
+
+**The network half has never run here.** `open_pull_request` builds a branch,
+commits a file and opens a draft PR through the real GitHub API, and no run in
+this repository has executed any of it — every demonstration stops at the tool's
+own refusal. Closing that gap honestly needs a throwaway repository someone owns.
+A test suite that writes to other people's repositories to prove a safety feature
+works would be its own argument against itself.
+
 **The check reports; it does not repair.** When a path is flagged, the orchestrator
 prefixes a warning and hands over the guide unchanged. Deleting the offending line
 would produce a clean-looking document nobody can verify, and the orchestrator
@@ -892,5 +970,5 @@ credited with the change it caused. See
 | 5 | Measurable regressions (eval set) | Done |
 | 6 | Sub-agents ≠ smaller AI calls (link-checker) | Done |
 | 7 | Prompt decomposition (skills) | Done |
-| 8 | Approval gates | Next |
-| 9 | Packaging | Planned |
+| 8 | Approval gates | Done |
+| 9 | Packaging | Next |

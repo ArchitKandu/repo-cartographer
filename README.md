@@ -34,7 +34,8 @@ reasoning behind the ordering.
 | 5 | Eval set: six repos, one score | Done |
 | 6 | Link-checker: a sub-agent with no model in it | Done |
 | 7 | Skills + AGENTS.md: instructions out of the prompts | Done |
-| 8+ | Approval gates, packaging | Planned |
+| 8 | Approval gate on the one irreversible action | Done |
+| 9 | Packaging: CI and a deploy | Planned |
 
 Phase 2's definition of done — *"in the transcript, it calls the built-in planning
 tool before calling any of yours, unprompted"* — is met. On `psf/requests` with
@@ -497,11 +498,100 @@ after-sweep wants the same model as the before-runs to be a controlled
 comparison, and that model's daily quota is spent; it is one command
 (`uv run scripts/run_evals.py`) once it resets.
 
+### Phase 8: the one thing it can do that cannot be undone
+
+Everything through Phase 7 reads. `tools.py` is four GET requests, `citations.py`
+compares strings, the workspace is a scratch directory nobody else can see. The
+worst outcome of a bad run has been a wrong sentence in a guide, and the fix for
+a wrong sentence is to run it again.
+
+`open_pull_request` breaks that. It writes a branch, a file and a draft pull
+request into a repository that is probably not yours, notifies its maintainers,
+and closing it does not unsend the notification. There is no version of "run it
+again" that helps — which makes it the right thing to build a gate around, and
+the reason the gate is the phase rather than the feature.
+
+**The definition of done is explicitly not "the parameter is set":**
+
+```console
+$ uv run scripts/prove_approval_gate.py
+
+1. running until the gate …
+   PAUSED. The graph stopped before the tool ran.
+   │ {'action_requests': [{'name': 'open_pull_request',
+   │   'args': {'repo': 'chalk', 'title': 'docs: add an onboarding guide', 'owner': 'chalk'}}],
+   │  'review_configs': [{'allowed_decisions': ['approve', 'edit', 'reject', 'respond']}]}
+
+   open_pull_request results so far: 0 — nothing has executed.
+
+2. resuming with a REJECTION …
+   │ [status=error]
+   │ Not this time.
+
+3. replaying the same run and APPROVING …
+   │ [status=success]
+   │ Refused: opening pull requests is switched off. …
+
+   tool body ran on rejection: False   on approval: True
+
+PASS — execution really pauses, and the two answers really differ.
+```
+
+The last line before the verdict is the one that matters. A gate that pauses and
+then behaves identically whatever you answer is theatre; the test is that the two
+branches *differ*. Rejecting produced a synthetic tool message the tool never
+wrote (`status=error`), and the call never ran. Approving released it into the
+function body — whose own first act was to refuse.
+
+**Two independent guards, because they stop different things:**
+
+| | Stops | Fails open when |
+|---|---|---|
+| `interrupt_on={"open_pull_request": True}` | the **agent** acting without a human | nobody is present to answer — it pauses instead |
+| `ALLOW_PULL_REQUESTS` | the **deployment** acting at all | somebody deliberately sets it |
+
+The second one is not belt-and-braces. An approval gate nobody has exercised is a
+gate nobody has tested, and the obvious way to test this one — approve it and see
+— would mean opening a real pull request on someone else's repository to prove
+that a safety feature works. With the env guard, the approve path runs all the
+way into the tool and GitHub is never called. That is why step 3 above is a real
+demonstration rather than a claim, and why the script *refuses to start* if
+`ALLOW_PULL_REQUESTS` is set.
+
+**The gate is narrow on purpose.** Exactly one tool is listed, and a test asserts
+the set has exactly one member. Gate every tool and whoever answers learns to
+approve without reading — and then the one call that mattered gets waved through
+with the rest.
+
+**What the gate cannot enforce, the prompt has to.** `interrupt_on` stops a call;
+it cannot stop the model deciding to make one on every run, and it cannot stop it
+rephrasing a rejected call and trying again. Both would respect the gate and
+defeat it. So `ORCHESTRATOR_PROMPT` gained three non-negotiable rules — only when
+the user asked, only after the citations were checked, and never retry a refusal
+— and `tests/test_approval.py` asserts they are still in there.
+
+**A checkpointer arrived with it**, because an interrupt without one is not a
+pause but a crash: `interrupt()` needs somewhere to write the run's state. That
+made `thread_id` mandatory on every invocation, which is exactly the requirement
+that gets forgotten in the fourth script rather than the first — hence one
+`run_config()` rather than four literals. It also introduced a trap worth naming:
+**a paused run returns normally.** Every caller that reaches for `messages[-1]`
+gets the assistant's tool call and reads it as prose. Nothing raises. `ask()` now
+checks for `__interrupt__` and says "PAUSED — waiting for your approval" instead
+of handing back half an answer.
+
+Two caveats. This ran on `gemini-3.1-flash-lite`, the default model's daily quota
+being spent, and the script prints the model because *whether the agent asks for a
+pull request at all* is a model decision. And no run in this repository has ever
+executed `open_pull_request`'s network half — that is a deliberate gap, and the
+honest way to close it is a throwaway repository you own, not a test suite that
+writes to other people's.
+
 What works right now: an orchestrator that sizes a repository up and splits it
 across up to three explorers, explorers that read one directory each and take
 notes, and a doc-writer that turns those notes into a guide
 with an architecture overview, a where-things-happen table, and an explicit list
-of what went unread. Still ahead: approval gates (Phase 8), packaging (Phase 9).
+of what went unread. Still ahead: packaging (Phase 9).
 Paths in the guide carry three prompts' instruction to cite only verified ones,
 one structural guarantee — the doc-writer has no GitHub access, so it cannot
 describe a file nobody read — and, since Phase 6, one arithmetic check: every
@@ -569,7 +659,7 @@ there. Every agent gets a deliberately narrow set:
 
 | | GitHub | workspace | other |
 |---|---|---|---|
-| orchestrator | `get_repo_scopes` only | `ls`, `read_file` | `task`, `write_todos` |
+| orchestrator | `get_repo_scopes` only | `ls`, `read_file` | `task`, `write_todos`, `open_pull_request` **(human-gated)** |
 | explorer (×N) | `get_repo_tree`, `get_file_contents`, `search_code` | `read_file`, `write_file` | `skills/` (read-only) |
 | doc-writer | — | `ls`, `read_file`, `write_file` | `AGENTS.md`, always applied |
 | link-checker | `get_repo_tree`, in Python | reads `/guide.md` directly | **no tools — it has no model to offer them to** |
@@ -772,7 +862,7 @@ them; configure one and it is used automatically.
 uv run pytest
 ```
 
-Expect `118 passed, 1 deselected`. These tests hit the real GitHub API with no
+Expect `134 passed, 1 deselected`. These tests hit the real GitHub API with no
 mocking, so a pass means your token works and the tools genuinely function. No
 model is called anywhere in the suite, so it costs nothing against your provider
 quota. A few tests skip themselves rather than fail if GitHub is unreachable or
@@ -875,7 +965,8 @@ repo-cartographer/
 │   ├── citations.py     Does this cited path exist? — no LLM code
 │   ├── link_checker.py  The graph around citations.py — a sub-agent with no model
 │   ├── skills.py        Mounts skills/ read-only; loads AGENTS.md
-│   └── tools.py         Four GitHub API functions — no LLM code
+│   ├── pull_requests.py The one irreversible action, behind two guards
+│   └── tools.py         Four GitHub API functions — all reads, no LLM code
 ├── skills/
 │   ├── python-repo/SKILL.md   Read only when the repo is Python
 │   └── node-repo/SKILL.md     Read only when the repo is JS/TS
@@ -885,12 +976,14 @@ repo-cartographer/
 │   ├── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
 │   ├── run_evals.py         Phase 5: six repos in, one score out
 │   ├── prove_link_checker.py  Phase 6: plant a fake path, watch it get caught
-│   └── show_skills.py       Phase 7: a Python repo and a JS repo, back to back
+│   ├── show_skills.py       Phase 7: a Python repo and a JS repo, back to back
+│   └── prove_approval_gate.py  Phase 8: trigger the gate, watch it stop
 ├── tests/
 │   ├── test_tools.py    Live tests against the real GitHub API
 │   ├── test_wiring.py   The four-way split, asserted without a model
 │   ├── test_citations.py  Does the checker catch an invented path? (no model)
 │   ├── test_skills.py   Are the skills found, reachable, and unwritable? (no model)
+│   ├── test_approval.py Is the irreversible action really gated? (no model)
 │   ├── test_evals.py    Is the eval set itself true? (live GitHub, no model)
 │   └── evals/
 │       ├── known_repos.jsonl   The dataset: 6 repos, 31 expected facts
@@ -947,6 +1040,7 @@ uv run scripts/run_evals.py --history           # every run recorded so far
 
 uv run scripts/prove_link_checker.py            # Phase 6's proof, ~2 model requests
 uv run scripts/show_skills.py                   # Phase 7's proof, 2 model runs
+uv run scripts/prove_approval_gate.py           # Phase 8's proof, 2 model runs
 ```
 
 `measure_context.py` spends real model quota — two runs per `--repeats`, each a

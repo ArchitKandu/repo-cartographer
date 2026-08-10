@@ -63,7 +63,14 @@ EXPECTED = {
     # The orchestrator divides, delegates and checks. `get_repo_scopes` is how it
     # learns a repository has a `src/` worth exploring; everything about what is
     # *in* src/ comes back through `task`.
-    "orchestrator": {"get_repo_scopes", "ls", "read_file", "task", "write_todos"},
+    "orchestrator": {
+        "get_repo_scopes",
+        "open_pull_request",
+        "ls",
+        "read_file",
+        "task",
+        "write_todos",
+    },
     "explorer": GITHUB_TOOLS | {"read_file", "write_file"},
     # Still the whole design in one line: three workspace tools and no repository
     # access. `write_file` arrived at Phase 6 so the guide becomes a file the
@@ -95,6 +102,7 @@ ALL_TOOL_NAMES = {
     "task",
     "write_todos",
     "get_repo_scopes",
+    "open_pull_request",
     *GITHUB_TOOLS,
 }
 
