@@ -43,7 +43,7 @@ Two guards, two different failure modes:
 
 | | Stops | Fails open when |
 |---|---|---|
-| `interrupt_on` | the agent acting without a human | nobody is present to answer — it pauses instead |
+| `interrupt_on` | the agent acting without a human | nobody is there to answer — it pauses |
 | `ALLOW_PULL_REQUESTS` | the deployment acting at all | somebody deliberately sets it |
 
 ## Why the writes live here and not in `tools.py`
@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import base64
 import os
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 import requests
@@ -189,24 +190,24 @@ def build_pull_request_tool(backend: BackendProtocol, guide_path: str):
 def _open(owner: str, repo: str, title: str, guide: str) -> str:
     """Branch, commit, draft PR. Four calls, in the only order that works."""
     repo_info = _get(f"{_API}/repos/{owner}/{repo}")
-    if repo_info.status_code != 200:
+    if repo_info.status_code != HTTPStatus.OK:
         raise GitHubError(f"cannot read {owner}/{repo}: {repo_info.status_code} - {repo_info.text}")
     base = repo_info.json()["default_branch"]
 
     head = _get(f"{_API}/repos/{owner}/{repo}/git/ref/heads/{base}")
-    if head.status_code != 200:
+    if head.status_code != HTTPStatus.OK:
         raise GitHubError(f"cannot resolve {base}: {head.status_code} - {head.text}")
     base_sha = head.json()["object"]["sha"]
 
-    # 422 here means the branch already exists, which is not a failure: a second
-    # proposal should update the existing one rather than refuse. Any other
+    # An existing branch answers 422, which is not a failure here: a second
+    # proposal should update the one already open rather than refuse. Any other
     # non-2xx is real.
     created = _send(
         "POST",
         f"/repos/{owner}/{repo}/git/refs",
         {"ref": f"refs/heads/{BRANCH}", "sha": base_sha},
     )
-    if created.status_code not in (201, 422):
+    if created.status_code not in (HTTPStatus.CREATED, HTTPStatus.UNPROCESSABLE_ENTITY):
         raise GitHubError(f"cannot create {BRANCH}: {created.status_code} - {created.text}")
 
     # The contents API commits a file in one call, which is why it is used here
@@ -219,11 +220,11 @@ def _open(owner: str, repo: str, title: str, guide: str) -> str:
         "content": base64.b64encode(guide.encode("utf-8")).decode("ascii"),
         "branch": BRANCH,
     }
-    if existing.status_code == 200:
+    if existing.status_code == HTTPStatus.OK:
         payload["sha"] = existing.json()["sha"]
 
     written = _send("PUT", f"/repos/{owner}/{repo}/contents/{GUIDE_FILENAME}", payload)
-    if written.status_code not in (200, 201):
+    if written.status_code not in (HTTPStatus.OK, HTTPStatus.CREATED):
         raise GitHubError(f"cannot commit {GUIDE_FILENAME}: {written.status_code} - {written.text}")
 
     opened = _send(
@@ -248,14 +249,14 @@ def _open(owner: str, repo: str, title: str, guide: str) -> str:
             ),
         },
     )
-    if opened.status_code == 422:
-        # A pull request from this branch is already open. Reporting the fact is
-        # more useful than an error, and it keeps a second run idempotent.
+    if opened.status_code == HTTPStatus.UNPROCESSABLE_ENTITY:
+        # A pull request from this branch is already open. Reporting that is more
+        # useful than raising, and it keeps a second run idempotent.
         return (
             f"A pull request from `{BRANCH}` is already open on {owner}/{repo}; the "
             f"guide on that branch was updated instead. GitHub said: {opened.text[:200]}"
         )
-    if opened.status_code != 201:
+    if opened.status_code != HTTPStatus.CREATED:
         raise GitHubError(f"cannot open the pull request: {opened.status_code} - {opened.text}")
 
     return f"Opened a draft pull request: {opened.json()['html_url']}"

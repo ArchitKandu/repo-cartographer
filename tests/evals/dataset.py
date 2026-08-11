@@ -122,7 +122,9 @@ def _parse_fact(raw: object, where: str) -> Fact:
         _require(key in raw, where, f"fact is missing {key!r}")
 
     fact_id = raw["id"]
-    _require(isinstance(fact_id, str) and bool(fact_id), where, "fact id must be a non-empty string")
+    _require(
+        isinstance(fact_id, str) and bool(fact_id), where, "fact id must be a non-empty string"
+    )
     where = f"{where} fact {fact_id!r}"
 
     kind = raw["kind"]
@@ -178,7 +180,9 @@ def _parse_case(raw: object, where: str) -> Case:
         _require(key in raw, where, f"case is missing {key!r}")
 
     case_id = raw["id"]
-    _require(isinstance(case_id, str) and bool(case_id), where, "case id must be a non-empty string")
+    _require(
+        isinstance(case_id, str) and bool(case_id), where, "case id must be a non-empty string"
+    )
     where = f"{where} case {case_id!r}"
 
     for key in ("owner", "repo", "question"):

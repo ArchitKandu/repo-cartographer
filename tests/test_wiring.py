@@ -29,7 +29,7 @@ than a test worth deleting: it means the mechanism the design rests on has moved
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -41,7 +41,13 @@ from repo_cartographer.prompts import (
 )
 
 if TYPE_CHECKING:
-    from deepagents import SubAgent
+    from deepagents import CompiledSubAgent, SubAgent
+
+    # What `build_subagents` returns. Two of the three entries are `SubAgent`
+    # and one is a `CompiledSubAgent` — Phase 6's claim expressed in the type.
+    # The helpers below take the union and narrow where they need to, rather
+    # than pretending every delegate has a prompt.
+    Spec = SubAgent | CompiledSubAgent
 
 # Importing repo_cartographer.agent builds a chat model, which needs a provider
 # key — see the note in `__init__.py` about why `agent` is not re-exported. Without
@@ -108,7 +114,7 @@ ALL_TOOL_NAMES = {
 
 
 @pytest.fixture(scope="module")
-def specs() -> list[SubAgent]:
+def specs() -> list[Spec]:
     """The sub-agent specs, built against a throwaway backend."""
     from deepagents.backends import FilesystemBackend
 
@@ -126,25 +132,35 @@ def specs() -> list[SubAgent]:
     )
 
 
-def _by_name(specs: list[SubAgent]) -> dict[str, SubAgent]:
-    return {spec["name"]: spec for spec in specs}
+def _by_name(specs: list[Spec]) -> dict[str, Spec]:
+    return {str(spec["name"]): spec for spec in specs}
 
 
-def _fs_middleware(spec: SubAgent) -> Any:
-    """The spec's FilesystemMiddleware, or None if it forgot to restate one."""
-    return next(
-        (m for m in spec.get("middleware", []) if m.name == "FilesystemMiddleware"),
-        None,
-    )
+def _fs_middleware(spec: Spec) -> Any:
+    """The spec's FilesystemMiddleware, or None if it forgot to restate one.
+
+    `None` is a real answer here rather than a lookup failure: a spec that never
+    restated the middleware is precisely the Phase 4 mistake this file exists to
+    catch, and it looks like an omission rather than an error.
+    """
+    middleware: Any = dict(spec).get("middleware") or []
+    return next((m for m in middleware if m.name == "FilesystemMiddleware"), None)
 
 
-def _workspace_tools(spec: SubAgent) -> set[str]:
+def _workspace_tools(spec: Spec) -> set[str]:
     fs = _fs_middleware(spec)
     return {t.name for t in fs.tools} if fs else set()
 
 
-def _declared_tools(spec: SubAgent) -> set[str]:
-    return {getattr(t, "name", None) or t.__name__ for t in spec.get("tools", [])}
+def _declared_tools(spec: Spec) -> set[str]:
+    """Tool names from a spec, however the tool was written.
+
+    A tool reaches a spec as a plain function, a `BaseTool`, or a dict, and each
+    carries its name somewhere different. `getattr` twice is the shortest way to
+    cover all three without asserting which one this project happens to use.
+    """
+    declared: Any = dict(spec).get("tools") or []
+    return {str(getattr(t, "name", None) or getattr(t, "__name__", t)) for t in declared}
 
 
 # --------------------------------------------------------------------------- #
@@ -152,11 +168,11 @@ def _declared_tools(spec: SubAgent) -> set[str]:
 # --------------------------------------------------------------------------- #
 
 
-def test_exactly_three_subagents(specs: list[SubAgent]) -> None:
+def test_exactly_three_subagents(specs: list[Spec]) -> None:
     assert set(_by_name(specs)) == {"explorer", "doc-writer", "link-checker"}
 
 
-def test_the_link_checker_holds_no_model(specs: list[SubAgent]) -> None:
+def test_the_link_checker_holds_no_model(specs: list[Spec]) -> None:
     """Phase 6's claim, asserted at the only place it could stop being true.
 
     A `CompiledSubAgent` carries a `runnable` and nothing else; a `SubAgent`
@@ -166,14 +182,16 @@ def test_the_link_checker_holds_no_model(specs: list[SubAgent]) -> None:
     still look like verdicts, and they would sometimes be wrong for reasons no
     test downstream could see. So the absence of a prompt is the assertion.
     """
-    checker = _by_name(specs)["link-checker"]
+    # Read as a plain mapping: the point of the assertion is which keys are
+    # *absent*, and a TypedDict cannot express "this key must not be here".
+    checker: dict[str, Any] = dict(_by_name(specs)["link-checker"])
     assert "runnable" in checker
     assert not {"system_prompt", "tools", "model"} & set(checker)
     # And it really is a graph that can be invoked, not a placeholder.
     assert hasattr(checker["runnable"], "invoke")
 
 
-def test_every_spec_declares_tools_explicitly(specs: list[SubAgent]) -> None:
+def test_every_spec_declares_tools_explicitly(specs: list[Spec]) -> None:
     """A spec that omits `tools` inherits the parent's, whatever those happen to be.
 
     The orchestrator's list is empty as of Phase 4, so the omission would leave a
@@ -186,18 +204,21 @@ def test_every_spec_declares_tools_explicitly(specs: list[SubAgent]) -> None:
         assert "tools" in spec, f"{name} would inherit the orchestrator's tools"
 
 
-def test_doc_writer_cannot_reach_github(specs: list[SubAgent]) -> None:
+def test_doc_writer_cannot_reach_github(specs: list[Spec]) -> None:
     """The guarantee the design rests on, asserted at the only place it is true."""
     doc_writer = _by_name(specs)["doc-writer"]
-    assert doc_writer["tools"] == []
+    # `== []` and not `not ...`: the empty list is the assertion. A spec that
+    # *omitted* the key would also be falsy, and would silently inherit the
+    # parent's tools instead — the exact failure this is guarding.
+    assert dict(doc_writer).get("tools") == []
     assert not _declared_tools(doc_writer) & GITHUB_TOOLS
 
 
-def test_explorer_holds_exactly_the_github_tools(specs: list[SubAgent]) -> None:
+def test_explorer_holds_exactly_the_github_tools(specs: list[Spec]) -> None:
     assert _declared_tools(_by_name(specs)["explorer"]) == GITHUB_TOOLS
 
 
-def test_each_spec_restates_filesystem_middleware(specs: list[SubAgent]) -> None:
+def test_each_spec_restates_filesystem_middleware(specs: list[Spec]) -> None:
     """Without this, a sub-agent gets the full built-in suite back.
 
     Parent middleware is not inherited by declarative sub-agents, so
@@ -210,13 +231,13 @@ def test_each_spec_restates_filesystem_middleware(specs: list[SubAgent]) -> None
         assert _fs_middleware(spec) is not None, f"{name} would get every built-in"
 
 
-def test_workspace_tools_match_the_intended_split(specs: list[SubAgent]) -> None:
+def test_workspace_tools_match_the_intended_split(specs: list[Spec]) -> None:
     for name in MODEL_SUBAGENTS:
         expected = EXPECTED[name] - GITHUB_TOOLS
         assert _workspace_tools(_by_name(specs)[name]) == expected
 
 
-def test_no_subagent_can_run_a_shell_or_delete_notes(specs: list[SubAgent]) -> None:
+def test_no_subagent_can_run_a_shell_or_delete_notes(specs: list[Spec]) -> None:
     """Stated separately from the set comparison because it is the consequence.
 
     `execute` has no sandbox to run in and only returns an error; `delete` points
@@ -229,7 +250,7 @@ def test_no_subagent_can_run_a_shell_or_delete_notes(specs: list[SubAgent]) -> N
         assert not held & {"execute", "delete", "glob", "grep"}, f"{name} holds one"
 
 
-def test_explorer_keeps_phase_3s_eviction_threshold(specs: list[SubAgent]) -> None:
+def test_explorer_keeps_phase_3s_eviction_threshold(specs: list[Spec]) -> None:
     """The explorer is the only agent that reads files, so it needs the threshold.
 
     Sub-agents get a fresh FilesystemMiddleware at the library default of 20_000
@@ -329,7 +350,7 @@ def _menu_names(description: str) -> set[str]:
     not it is enabled — a substring check on the full text can never pass. The menu
     is the bulleted block before the "Specify subagent_type" line.
     """
-    menu = description.split("Specify subagent_type")[0]
+    menu = description.split("Specify subagent_type", maxsplit=1)[0]
     return {
         line.removeprefix("- ").split(":", 1)[0]
         for line in menu.splitlines()
@@ -354,6 +375,8 @@ def test_compiled_orchestrator_sees_only_its_four_tools(compiled: Any) -> None:
     filtering was broken, so the filter is applied here the way the graph applies
     it.
     """
+    from langchain.agents.middleware.types import ModelRequest
+
     from repo_cartographer.middleware import RestrictToolsMiddleware
 
     node = compiled.nodes["tools"]
@@ -366,7 +389,11 @@ def test_compiled_orchestrator_sees_only_its_four_tools(compiled: Any) -> None:
         def override(self, tools: list[Any]) -> Any:
             return _Request(tools)
 
-    visible = RestrictToolsMiddleware()._filter(_Request(bound)).tools
+    # `_Request` stands in for a `ModelRequest`, which cannot be constructed here
+    # without a live agent runtime. The middleware touches only `.tools` and
+    # `.override`, so the stand-in is complete for what is being tested.
+    request = cast("ModelRequest[Any]", _Request(bound))
+    visible: list[Any] = list(RestrictToolsMiddleware()._filter(request).tools)
     assert {t.name for t in visible} == EXPECTED["orchestrator"]
 
 

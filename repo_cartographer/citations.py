@@ -28,11 +28,11 @@ The input is markdown a language model wrote, so extraction is a heuristic and
 worth stating plainly. Every maximal run of path characters is a candidate, and
 each one lands in exactly one of three buckets:
 
-| Bucket | When | Reported as |
-|---|---|---|
-| **verified** | in the tree, or a directory prefix of a tree path, or a bare filename matching some tree entry's basename | a path that checks out |
-| **not found** | not verified, *and* it contains a slash, *and* its last segment ends in a recognised source or config extension | **the flag** |
-| **not a citation** | everything else | counted, never named |
+| Bucket | When |
+|---|---|
+| **verified** | in the tree; a directory prefix of one; or a bare name matching an entry |
+| **not found** | not verified, **and** has a slash, **and** ends in a known extension |
+| **not a citation** | everything else — counted, never named |
 
 That third bucket is what keeps the check from crying wolf, and both conditions
 guarding the flag are there because of a specific false positive:

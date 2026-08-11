@@ -162,7 +162,13 @@ def main() -> int:
     print("   PAUSED. The graph stopped before the tool ran.\n")
     quote("what it is asking permission for:", str(interrupt.value))
     print()
-    assert not tool_messages(state), "the tool ran before approval — the gate did nothing"
+    if tool_messages(state):
+        # A hard check rather than an `assert`: this is the single claim the
+        # script exists to make, and `python -O` strips asserts.
+        raise SystemExit(
+            "FAIL — the tool produced a result before anyone approved it. The gate "
+            "did nothing, which is the failure this phase exists to prevent."
+        )
     print(f"   {PULL_REQUEST_TOOL} results so far: 0 — nothing has executed.\n")
 
     print("2. resuming with a REJECTION …")

@@ -11,9 +11,10 @@ entirely:
 
 | Lives in | What it is | Loaded |
 |---|---|---|
-| `skills/python-repo/SKILL.md` | which files answer which questions in a Python repo | **only when the explorer decides it applies** |
+| `skills/python-repo/SKILL.md` | what to read in a Python repo, in order | **only if it matches** |
 | `skills/node-repo/SKILL.md` | the same for JavaScript and TypeScript | same |
-| `AGENTS.md` | this project's house style for a guide | always, into the doc-writer |
+| `AGENTS.md` | this project's house style for a guide | always, on the doc-writer |
+
 
 The difference between those two rows is the whole design. A skill is
 *conditional*: the explorer is shown a one-line description of each and reads the
@@ -131,14 +132,22 @@ class ReadOnlyBackend(FilesystemBackend):
     def _refuse(self, file_path: str) -> str:
         return _READ_ONLY.format(path=f"{self._mount}{file_path}")
 
-    def write(self, file_path: str, content: str) -> WriteResult:
+    # The unused parameters below are not oversights: an override has to keep the
+    # base class's signature, and these are called by name from middleware that
+    # knows nothing about this subclass. Renaming them to silence ARG002 would
+    # break the calls it is trying to protect.
+    def write(self, file_path: str, content: str) -> WriteResult:  # noqa: ARG002
         return WriteResult(error=self._refuse(file_path))
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return self.write(file_path, content)
 
     def edit(
-        self, file_path: str, old_string: str, new_string: str, replace_all: bool = False
+        self,
+        file_path: str,
+        old_string: str,  # noqa: ARG002
+        new_string: str,  # noqa: ARG002
+        replace_all: bool = False,  # noqa: ARG002
     ) -> EditResult:
         return EditResult(error=self._refuse(file_path))
 

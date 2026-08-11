@@ -30,6 +30,8 @@ so both get their own test, including the near-miss each is there to reject.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import requests
 
@@ -54,9 +56,14 @@ BY_ID = {case.id: case for case in CASES}
 
 def _fact(**overrides: object) -> Fact:
     """A minimal valid Fact, for the scorer tests that need one to hand."""
-    fields: dict = {"id": "f", "kind": "path", "any_of": ("src/x.py",), "why": "because"}
+    fields: dict[str, Any] = {
+        "id": "f",
+        "kind": "path",
+        "any_of": ("src/x.py",),
+        "why": "because",
+    }
     fields.update(overrides)
-    return Fact(**fields)  # type: ignore[arg-type]
+    return Fact(**fields)
 
 
 # --------------------------------------------------------------------------- #
@@ -74,7 +81,7 @@ def test_case_ids_are_unique_and_usable_as_filenames() -> None:
     """Case ids name both a `--case` argument and a file in results/."""
     ids = [case.id for case in CASES]
     assert len(ids) == len(set(ids))
-    assert all(id.replace("-", "").replace("_", "").isalnum() for id in ids)
+    assert all(case_id.replace("-", "").replace("_", "").isalnum() for case_id in ids)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)

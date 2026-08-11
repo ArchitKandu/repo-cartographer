@@ -1,7 +1,7 @@
 [project]
 name = "repo-cartographer"
 version = "0.1.0"
-description = "Add your description here"
+description = "An agent that reads a public GitHub repository and writes an onboarding guide"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -24,6 +24,16 @@ log_cli_format = "%(message)s"
 log_cli_date_format = "%H:%M:%S"
 log_format = "%(message)s"
 log_level = "INFO"
+# A warning is a defect that has not failed yet, so the suite treats one as a
+# failure rather than as a line of grey text nobody reads. Third-party
+# deprecations are the exception: they are real, but they are somebody else's
+# release schedule, and turning them into red here would mean the suite breaks
+# on a dependency bump rather than on a change to this code.
+filterwarnings = [
+    "error",
+    "default::DeprecationWarning",
+    "default::PendingDeprecationWarning",
+]
 
 [dependency-groups]
 dev = [
@@ -31,3 +41,114 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.1",
 ]
+
+# --------------------------------------------------------------------------- #
+# Ruff
+# --------------------------------------------------------------------------- #
+#
+# This section is newer than most of the code, and writing it fixed a real
+# problem rather than adding a preference. Ruff's default rule set is very small
+# — pyflakes plus a few pycodestyle errors — while the code had been written
+# against a much wider one for phases: `# noqa: TRY004`, `# noqa: BLE001`,
+# `# noqa: C901` all name rules that were never switched on. Those comments were
+# documenting an intention nothing enforced, and one of them was already stale.
+#
+# So the set below is chosen to be the one this codebase was already assuming.
+# Everything it reports is fixed rather than silenced; the `ignore` list is short
+# and every entry is a stated position rather than a shrug.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes — the real errors
+    "E", "W", # pycodestyle
+    "I",      # import sorting
+    "UP",     # pyupgrade — keep to the language version we claim
+    "B",      # bugbear — the mistakes that look fine
+    "A",      # builtin shadowing
+    "C4",     # comprehensions
+    "C90",    # mccabe complexity
+    "SIM",    # simplification
+    "RET",    # return consistency
+    "ARG",    # unused arguments
+    "PTH",    # pathlib over os.path
+    "TRY",    # exception antipatterns
+    "EM",     # exception message construction
+    "BLE",    # blind except
+    "RUF",    # ruff's own
+    "PL",     # pylint
+    "N",      # pep8 naming
+    "DTZ",    # timezone-aware datetimes
+    "ISC",    # implicit string concatenation
+    "PIE",    # miscellaneous lints
+    "T20",    # print statements
+    "S",      # bandit — security
+    "PERF",   # performance antipatterns
+    "FLY",    # static string joins
+    "LOG", "G",  # logging
+    "INP",    # missing __init__.py
+    "TID",    # tidy imports
+    "FA",     # future annotations
+    "ICN",    # import conventions
+    "Q",      # quote consistency
+    "SLF",    # private member access
+    "PT",     # pytest style
+    "YTT", "ASYNC",
+]
+ignore = [
+    # This project writes long, specific error messages on purpose: several of
+    # them are read by a language model mid-run and are the only thing telling it
+    # how to recover. `EM`/`TRY003` would push that text into named constants
+    # away from the `raise`, which is exactly where a reader needs it.
+    "TRY003",
+    "EM101",
+    "EM102",
+    # Deliberate and documented: `agent.py`, `run_evals.py` and others import
+    # inside functions so that `--history` and the test suite work without a
+    # provider key. Importing at module scope would build a chat model on import.
+    "PLC0415",
+    # The prose in this codebase uses typographic punctuation — em dashes, arrows,
+    # box-drawing characters in the diagrams. These rules flag them as ambiguous
+    # Unicode, which for documentation is the wrong call.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # Conflicts with the formatter's own handling of implicit concatenation.
+    "ISC001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# `assert` is the point of a test, and reaching into private structure is
+# sometimes the only way to check that a library honoured a spec — both are
+# argued for in the test modules that do it.
+"tests/**" = ["S101", "SLF001", "PLR2004", "ARG001", "PT018"]
+# Scripts are command-line programs whose output *is* their result, and they are
+# deliberately not an importable package.
+"scripts/**" = ["T201", "INP001"]
+"main.py" = ["T201"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+# --------------------------------------------------------------------------- #
+# Mypy
+# --------------------------------------------------------------------------- #
+#
+# Covers the tests too. They are the part of this repository that reaches into
+# library internals — the `task` tool's closure, a middleware's resolved config —
+# so they are where a type error is most likely and least visible.
+
+[tool.mypy]
+python_version = "3.12"
+files = ["repo_cartographer", "scripts", "tests", "main.py"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# The library surfaces this code inspects are typed loosely (or as `Any`), and
+# demanding annotations everywhere would mostly produce noise in test helpers.
+# The package itself is annotated; this keeps the bar at "no wrong types" rather
+# than "no missing ones".
+disallow_untyped_defs = false

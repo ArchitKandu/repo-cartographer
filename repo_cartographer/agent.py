@@ -488,4 +488,6 @@ def ask(
 
 
 if __name__ == "__main__":
-    print(ask(EXAMPLE_QUESTION))
+    # `python -m repo_cartographer.agent` is a CLI entry point, so printing is
+    # the interface rather than a stray debug statement.
+    print(ask(EXAMPLE_QUESTION))  # noqa: T201

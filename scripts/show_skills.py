@@ -150,7 +150,8 @@ def run_one(slug: str, expected: str) -> Run:
                     if not namespace and text:
                         guide = text
     except Exception as exc:  # noqa: BLE001 — a failed run is a reported outcome
-        return Run(slug, expected, tuple(dict.fromkeys(read)), guide, f"{type(exc).__name__}: {exc}")
+        error = f"{type(exc).__name__}: {exc}"
+        return Run(slug, expected, tuple(dict.fromkeys(read)), guide, error)
 
     return Run(slug, expected, tuple(dict.fromkeys(read)), guide)
 
@@ -197,7 +198,11 @@ def report(runs: list[Run]) -> int:
         return 2
 
     if not selected:
-        crossed = [f"{r.slug} read {list(r.skills_read)}" for r in runs if r.skills_read != (r.expected,)]
+        crossed = [
+            f"{r.slug} read {list(r.skills_read)}"
+            for r in runs
+            if r.skills_read != (r.expected,)
+        ]
         print(
             "PARTIAL — a skill was read on every run, but not exclusively the "
             f"matching one: {'; '.join(crossed)}. Progressive disclosure still saved "

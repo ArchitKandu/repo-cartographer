@@ -25,6 +25,8 @@ skill: that is a model decision, so it belongs to the eval set and to
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from deepagents.middleware.skills import SkillsMiddleware
 
@@ -41,6 +43,17 @@ from repo_cartographer.skills import (
 )
 
 EXPECTED_SKILLS = {"python-repo", "node-repo"}
+
+
+def _specs_by_name() -> dict[str, dict[str, Any]]:
+    """The sub-agent specs as plain mappings, keyed by name.
+
+    Plain dicts rather than the `SubAgent`/`CompiledSubAgent` union, because
+    these tests ask about keys that exist on one member and not the other —
+    `system_prompt` on the two that think, `skills` on the one that explores.
+    """
+    specs = build_subagents(build_backend(WORKSPACE), tool_result_token_limit=2_000)
+    return {str(spec["name"]): dict(spec) for spec in specs}
 
 
 @pytest.fixture(scope="module")
@@ -185,8 +198,7 @@ def test_the_doc_writer_carries_the_house_style_and_the_others_do_not() -> None:
     writes no prose, and putting it on the orchestrator would invite it to edit a
     guide it is told to relay unchanged.
     """
-    specs = {spec["name"]: spec for spec in build_subagents(build_backend(WORKSPACE),
-                                                            tool_result_token_limit=2_000)}
+    specs = _specs_by_name()
     marker = "Deliberately not required"  # a phrase that exists only in AGENTS.md
 
     assert marker in specs["doc-writer"]["system_prompt"]
@@ -254,8 +266,7 @@ def test_only_the_explorer_is_given_the_skills_mount() -> None:
     advice it cannot act on — and the skills index costs system-prompt tokens on
     every turn of whichever agent carries it.
     """
-    specs = {spec["name"]: spec for spec in build_subagents(build_backend(WORKSPACE),
-                                                            tool_result_token_limit=2_000)}
+    specs = _specs_by_name()
     assert specs["explorer"].get("skills") == [SKILLS_MOUNT]
     assert "skills" not in specs["doc-writer"]
     assert "skills" not in specs["link-checker"]

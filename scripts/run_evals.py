@@ -332,26 +332,38 @@ def select(cases: tuple[Case, ...], wanted: list[str]) -> list[Case]:
     known = {case.id for case in cases}
     unknown = sorted(set(wanted) - known)
     if unknown:
-        raise SystemExit(f"no such case(s): {', '.join(unknown)}. Known: {', '.join(sorted(known))}")
+        raise SystemExit(
+            f"no such case(s): {', '.join(unknown)}. "
+            f"Known: {', '.join(sorted(known))}"
+        )
     return [case for case in cases if case.id in set(wanted)]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--case", action="append", default=[], metavar="ID",
-                        help="run/score one case only; repeatable")
-    parser.add_argument("--score-only", action="store_true",
-                        help="score the recorded guides without calling a model")
-    parser.add_argument("--history", action="store_true",
-                        help="list every recorded run for each case, then exit")
-    parser.add_argument("--fail-under", type=float, default=None, metavar="PCT",
-                        help="exit 1 if the percentage of facts present falls below PCT")
+    parser.add_argument(
+        "--case", action="append", default=[], metavar="ID",
+        help="run/score one case only; repeatable",
+    )
+    parser.add_argument(
+        "--score-only", action="store_true",
+        help="score the recorded guides without calling a model",
+    )
+    parser.add_argument(
+        "--history", action="store_true",
+        help="list every recorded run for each case, then exit",
+    )
+    parser.add_argument(
+        "--fail-under", type=float, default=None, metavar="PCT",
+        help="exit 1 if the percentage of facts present falls below PCT",
+    )
     args = parser.parse_args()
 
     cases = load_cases()
     selected = select(cases, args.case)
 
-    print(f"dataset: {DATASET.relative_to(Path.cwd()) if DATASET.is_relative_to(Path.cwd()) else DATASET}")
+    shown = DATASET.relative_to(Path.cwd()) if DATASET.is_relative_to(Path.cwd()) else DATASET
+    print(f"dataset: {shown}")
     print(f"         {len(selected)} case(s), {total_facts(tuple(selected))} facts")
 
     if args.history:

@@ -20,8 +20,8 @@ be judged against the same number instead of against a fresh impression.
 
 | File | What it is |
 |---|---|
-| `known_repos.jsonl` | The dataset: one case per line, each a repo, a question, and the facts the guide should carry |
-| `dataset.py` | Loads and validates that file into `Case` and `Fact` objects |
+| `known_repos.jsonl` | The dataset: one case per line — repo, question, expected facts |
+| `dataset.py` | Loads and validates it into `Case` and `Fact` objects |
 | `scoring.py` | Given a guide and a case, which facts are present |
 | `results/` | Recorded runs, git-ignored — written by the runner, read by `--score-only` |
 

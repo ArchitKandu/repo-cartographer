@@ -16,6 +16,7 @@ explorers without being able to do the work itself. See `agent.py`.
 import base64
 import os
 import time
+from http import HTTPStatus
 from urllib.parse import quote
 
 import requests
@@ -125,15 +126,17 @@ def get_repo_tree(owner: str, repo: str, ref: str = "HEAD") -> list[str]:
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
     response = _get(url)
 
-    if response.status_code != 200:
-        raise GitHubError(f"Failed to fetch repository tree: {response.status_code} - {response.text}")
+    if response.status_code != HTTPStatus.OK:
+        raise GitHubError(
+            f"Failed to fetch repository tree: {response.status_code} - {response.text}"
+        )
 
     tree_data = response.json()
 
     # GitHub caps a recursive tree at ~100k entries / 7MB and flags the cut with
     # truncated=true. Returning the partial list would give the caller a tree
     # that looks complete, so fail loudly rather than silently under-report.
-    if tree_data.get('truncated'):
+    if tree_data.get("truncated"):
         raise GitHubError(
             f"GitHub truncated the tree for {owner}/{repo}@{ref} — "
             f"{len(tree_data.get('tree', []))} entries returned, more exist. "
@@ -141,7 +144,7 @@ def get_repo_tree(owner: str, repo: str, ref: str = "HEAD") -> list[str]:
             "this tool does not do; explore a subdirectory instead."
         )
 
-    return [item['path'] for item in tree_data.get('tree', []) if item.get('type') == 'blob']
+    return [item["path"] for item in tree_data.get("tree", []) if item.get("type") == "blob"]
 
 def get_repo_scopes(owner: str, repo: str, ref: str = "HEAD") -> list[dict]:
     """
@@ -185,12 +188,12 @@ def get_repo_scopes(owner: str, repo: str, ref: str = "HEAD") -> list[dict]:
 def get_file_contents(owner: str, repo: str, path: str) -> str:
     """
     Get the contents of a file in a GitHub repository.
-    
+
     Args:
         owner (str): The owner of the repository.
         repo (str): The name of the repository.
         path (str): The path to the file in the repository.
-        
+
     Returns:
         str: The contents of the file as a string.
 
@@ -203,8 +206,10 @@ def get_file_contents(owner: str, repo: str, path: str) -> str:
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     response = _get(url)
 
-    if response.status_code != 200:
-        raise GitHubError(f"Failed to fetch file contents: {response.status_code} - {response.text}")
+    if response.status_code != HTTPStatus.OK:
+        raise GitHubError(
+            f"Failed to fetch file contents: {response.status_code} - {response.text}"
+        )
 
     file_data = response.json()
 
@@ -227,7 +232,7 @@ def get_file_contents(owner: str, repo: str, path: str) -> str:
 
     # A symlink or submodule is a "file" only in the loosest sense: GitHub sends
     # a target or a git URL where the content would be, and no content at all.
-    if file_data.get('type') != 'file':
+    if file_data.get("type") != "file":
         raise ValueError(
             f"'{path}' in {owner}/{repo} is a {file_data.get('type')}, not a "
             "regular file, so it has no contents to read."
@@ -237,8 +242,8 @@ def get_file_contents(owner: str, repo: str, path: str) -> str:
     # content field — decoding that yields "" and reads as an empty file. Refuse
     # instead: a file this size is a lockfile, a generated bundle or a dataset,
     # which is exactly what an agent should skip rather than pull into context.
-    if file_data.get('encoding') != 'base64':
-        size = file_data.get('size', 0)
+    if file_data.get("encoding") != "base64":
+        size = file_data.get("size", 0)
         raise ValueError(
             f"'{path}' in {owner}/{repo} is {size / 1_000_000:.1f} MB, over "
             f"GitHub's {_MAX_INLINE_BYTES // 1_000_000} MB inline limit, so the "
@@ -248,7 +253,7 @@ def get_file_contents(owner: str, repo: str, path: str) -> str:
         )
 
     try:
-        return base64.b64decode(file_data['content']).decode('utf-8')
+        return base64.b64decode(file_data["content"]).decode("utf-8")
     except UnicodeDecodeError as exc:
         # Binary blobs decode to bytes that are not UTF-8. Raising is right,
         # but the bare codec error names no path, so an agent reading a tree
@@ -261,12 +266,12 @@ def get_file_contents(owner: str, repo: str, path: str) -> str:
 def search_code(owner: str, repo: str, query: str) -> list[dict]:
     """
     Search for code in a GitHub repository.
-    
+
     Args:
         owner (str): The owner of the repository.
         repo (str): The name of the repository.
         query (str): The search query.
-        
+
     Returns:
         list[dict]: A list of search results, each represented as a dictionary.
             No matches is an empty list, not an error.
@@ -283,8 +288,8 @@ def search_code(owner: str, repo: str, query: str) -> list[dict]:
     url = f"https://api.github.com/search/code?q={quote(query, safe='')}+repo:{owner}/{repo}"
     response = _get(url)
 
-    if response.status_code != 200:
+    if response.status_code != HTTPStatus.OK:
         raise GitHubError(f"Failed to search code: {response.status_code} - {response.text}")
-    
+
     search_results = response.json()
-    return search_results.get('items', [])
+    return search_results.get("items", [])

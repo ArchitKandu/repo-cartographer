@@ -440,7 +440,7 @@ Two mounts, one namespace, and the second one is why: `SkillsMiddleware`
 advertises a path and tells the model to `read_file` it, so a skill has to live
 in the same filesystem the explorer already reads from. Its route is read-only
 because `./skills` is inside this git repository — see
-[decision 10](#thirteen-decisions-that-are-the-architecture).
+[decision 10](#fifteen-decisions-that-are-the-architecture).
 
 `guide.md` is the newer of the two handoffs and the more interesting one, because
 the agent on the receiving end is a plain function. A file is the only channel a
@@ -725,10 +725,15 @@ Two properties are worth knowing before quoting it:
 
 Recorded runs go to `tests/evals/results/` as a growing log, so `--score-only`
 re-scores them against the current dataset for free. Each record carries the
-model and a fingerprint of all three prompts, and a record whose fingerprint no
-longer matches the prompts on disk is reported as stale — because the failure
-this instrument invites is editing a prompt, re-scoring without re-running, and
-reading an unchanged number as evidence the edit was neutral.
+model and a fingerprint of **every instruction the agents work from** — the three
+prompts, `AGENTS.md`, and each `SKILL.md` — and a record whose fingerprint no
+longer matches what is on disk is reported as stale.
+
+That list grew at Phase 7, and it had to. The failure this instrument invites is
+editing an instruction, re-scoring without re-running, and reading an unchanged
+number as evidence the edit was neutral — and the two newest kinds of instruction
+are precisely the ones most likely to be edited, because editing them needs no
+Python at all.
 
 ### The skills, and which one was read
 
@@ -956,9 +961,11 @@ Go or Rust is a new `SKILL.md` and no code.
 
 ## Where this sits in the build
 
-The project is built one concept at a time, deliberately, so that each phase can be
-credited with the change it caused. See
-[IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) for the reasoning.
+The project is built one concept at a time, deliberately, so that each phase can
+be credited with the change it caused. **[BUILD_LOG.md](BUILD_LOG.md)** has what
+each phase isolated and the measurement that showed it worked;
+[IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) has the plan they follow and
+the reasoning behind their ordering.
 
 | Phase | Concept it isolates | State |
 |---|---|---|
@@ -972,3 +979,16 @@ credited with the change it caused. See
 | 7 | Prompt decomposition (skills) | Done |
 | 8 | Approval gates | Done |
 | 9 | Packaging | Next |
+
+---
+
+## Where to go next
+
+- **[README.md](README.md)** — what the project is, what it produces, how to run
+  it, and how to set it up.
+- **[BUILD_LOG.md](BUILD_LOG.md)** — the evidence behind every claim above,
+  phase by phase.
+- **The code itself.** Every module in `repo_cartographer/` opens with a
+  docstring explaining what it is for and which decisions inside it are
+  load-bearing. `agent.py` is the org chart; `tools.py` and `citations.py` are
+  the two layers with no AI in them at all.
