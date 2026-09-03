@@ -611,6 +611,66 @@ writes to other people's.
 
 ---
 
+## After Phase 8: the requests nobody was reading code with
+
+Not a phase — no new mechanism, no new capability, and it is recorded here rather
+than in the table above because it has **no measurement yet.** That is stated
+first on purpose, since the rest of this file is measurements.
+
+The free tier's binding limit turned out not to be tokens per day but **requests
+per minute**: fifteen, shared by every agent in a run, which is the ceiling
+Phase 4b's fan-out ran into and the rate limiter exists to pace. A request is
+spent per model turn, so on that budget the unit of waste is a *turn*, and the
+cheapest turn is the one that never happens.
+
+Reading Phase 4's own trace with that in mind, three of its lines stand out:
+
+```
+get_repo_tree → filter to src/    get_repo_tree → filter to root
+read_file /skills/python-repo/    read_file /skills/python-repo/
+get_file_contents __init__.py     get_file_contents pyproject.toml
+get_file_contents sessions.py     get_file_contents setup.py
+...
+```
+
+Four requests went on the first two rows before either explorer had read a line
+of the repository — and neither row is a question a model is needed for. *Which
+files are in this scope* is a filter over a list. *Which skill matches* is
+`"pyproject.toml" in paths`. That is Phase 6's argument arriving somewhere new:
+the link-checker beat an LLM at checking citations because checking a citation is
+arithmetic, and these two are arithmetic as well. The only reason they were model
+decisions is that the model was already there.
+
+So `briefing.py` answers both in Python before an explorer starts and splices the
+answers into its prompt, and `EXPLORER_PROMPT` now asks for the file reads in
+batches — the explorer picks its whole first batch before reading any of it, so
+those reads cannot depend on each other and four of them in one message tell it
+exactly what four messages would.
+
+**What is claimed, and what is not.** The prefetch is arithmetic: four requests
+per two-explorer run, and one shared GitHub tree fetch instead of one per
+explorer. The batching is not — it is a model decision, in exactly the way the
+fan-out in Phase 4b is a model decision, and a prompt asking for it is not
+evidence that it happened.
+
+**How to close that.** `scripts/show_contexts.py` already prints turns per agent
+and tool calls per turn, and turns *are* requests. So the number this needs is
+one the instrument already reports, on a run nobody has made yet:
+
+```
+uv run scripts/show_contexts.py
+```
+
+Until then this section claims a design, not a result. Two things it should be
+checked against when the run happens, because both would be invisible in an
+answer that still reads well: whether the injected file list pushed the
+explorer's own context up more than the two saved turns pulled it down, and
+whether an explorer told to batch reads four files it chose in advance rather
+than the four it would have chosen by following imports. The first is a token
+figure `show_contexts.py` prints. The second is what `run_evals.py` is for.
+
+---
+
 ## Where to go next
 
 - **[README.md](README.md)** — what the project is, and how to run it.

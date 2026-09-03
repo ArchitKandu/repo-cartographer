@@ -198,6 +198,11 @@ actually *says* has to come back from an explorer.
        │                     agent.py                    link_checker.py
        │             the org chart — the ONLY file   the graph wrapper: brief
        │            that imports all the others  ◄──  in, verdict out, 1 node
+       │                          ▲
+       │                          └────────────────────  briefing.py
+       │                                            the explorer's file list
+       │                                            and its matching skill,
+       │                                            worked out before it starts
        │                          │
        │   skills/*/SKILL.md and AGENTS.md are not imported by anything.
        │   They are read at run time, through the backend skills.py builds.
@@ -212,7 +217,10 @@ actually *says* has to come back from an explorer.
 ```
 
 **The shape is the point.** The six modules on the top row import *nothing* from
-this project except each other's leaves. That makes each one independently
+this project except each other's leaves. `link_checker.py` and `briefing.py` sit
+below them because they compose them — the first wraps `citations.py` in a graph,
+the second joins `tools.py` and `skills.py` into a prompt — and neither knows
+anything about the agents that use it. That makes each one independently
 testable and independently replaceable — swap the model, and you touch one file;
 reword a prompt, one file. `agent.py` is the single place where they are composed
 into a working system.
@@ -229,7 +237,8 @@ lets a graph call one.
 | `prompts.py` | `ORCHESTRATOR_PROMPT`, `EXPLORER_PROMPT`, `DOC_WRITER_PROMPT` | Content, not wiring. Three prompts inline would bury the 20-line graph definition they surround. Three prompts, four agents — the link-checker has no model to instruct |
 | `middleware.py` | `RestrictToolsMiddleware` | Hides built-in tools from the orchestrator per model request |
 | `citations.py` | `check_citations`, `cited_paths` | The second deterministic layer. Decides whether a cited path exists, with no model and no agent code, so the verdict is a fact. Testable with a list of strings |
-| `link_checker.py` | `build_link_checker`, `parse_brief` | The graph around `citations.py`: parse a brief, read the guide, return a verdict. Separate so the part that decides anything needs no graph to test |
+| `link_checker.py` | `build_link_checker`, `parse_brief` | The graph around `citations.py`: parse a brief, read the guide, return a verdict. Separate so the part that decides anything needs no graph to test. Its brief parser is shared with `briefing.py` — one convention, one reader |
+| `briefing.py` | `BriefingMiddleware`, `parse_brief`, `match_skill` calls | Work the explorer used to spend a model request on: its file list, and which skill matches. Both are arithmetic, so both are done here before its first turn and spliced into its prompt. Pure optimisation — every path through it can decline, and the explorer keeps the tools to do it by hand |
 | `skills.py` | `build_backend`, `ReadOnlyBackend`, `house_style` | Where the instructions that are *not* Python get mounted. Composes the writable workspace with a read-only `/skills/` route, and loads `AGENTS.md` |
 | `skills/*/SKILL.md`, `AGENTS.md` | Ecosystem conventions; house style | Not code at all. Edited by a person, loaded at run time, and the reason `prompts.py` stopped growing per ecosystem |
 | `agent.py` | `build_subagents()`, `build_agent()`, `ask()` | The org chart: who reports to whom, who gets which tools |
@@ -300,6 +309,12 @@ Each brief must stand alone. The explorer cannot ask a follow-up question, so th
 brief carries the owner, the repo, **its own** scope, the question in full, and
 **its own** notes path.
 
+The first line of it is machine-readable — `owner=… repo=… scope=… notes=…`, the
+same form the link-checker's brief has taken since Phase 6 — because
+`briefing.py` reads it before the explorer starts, to fetch the file list and
+match the skill on its behalf. A brief written any other way still works; the
+explorer simply pays for both itself.
+
 ### Step 4 · each explorer works in its own conversation
 
 ```
@@ -317,6 +332,29 @@ write_file /notes/src.md          write_file /notes/root.md
                                   ↑
         ONE write, at the very end, never appended to
 ```
+
+**Three of those lines are no longer paid for, and the trace above is why they
+were worth removing.** Every line in it is one model request, because a turn is
+spent per model call: the two explorers together spent four requests on
+`get_repo_tree` and the skill before either had read a line of the repository,
+and then read four files one message at a time.
+
+None of that first part needs a model. Which files are in a scope is a filter
+over a list; which skill matches is `"pyproject.toml" in paths`. So `briefing.py`
+answers both in Python before the explorer starts and splices the answers into
+its prompt, and `EXPLORER_PROMPT` asks for the reads in batches — the explorer
+chooses its whole first batch before reading any of it, so those reads cannot
+depend on each other and there is nothing to gain by spacing them out.
+
+**The trace above is the recorded run, not the current one.** It is left as it
+was because it is evidence, and the version of this system that produced it is
+the version those numbers describe. What the change is expected to save is
+arithmetic — four prefetch requests, plus one per batched read after the first —
+but *expected* is the operative word: batching is a model decision in exactly the
+way the orchestrator's fan-out above is, nothing in the library arranges it, and
+this project's rule is that a claim needs a measurement. `show_contexts.py`
+reports turns per agent and tool calls per turn, which is where that measurement
+comes from when the run is made.
 
 Real output from that run — `workspace/notes/src.md`, 61 lines:
 
@@ -545,6 +583,14 @@ the published limit.
 Which means the explorers run "in parallel" but finish no sooner than the queue
 lets them through. **On a per-minute request budget, concurrency buys separate
 contexts — not wall-clock speed.** That is the honest claim for the fan-out.
+
+It also changes what "optimisation" means here. The thing worth reducing is not
+tokens but *requests*, and a request is spent per model turn — so the cheapest
+turn is the one that never happens. Two follow, and both are visible in the trace
+above: work that a Python function could have done (`briefing.py`), and work the
+model did in four messages that it could have done in one. Neither is a
+micro-optimisation on this budget. `show_contexts.py` prints turns per agent, and
+that column is the number to watch.
 
 ---
 

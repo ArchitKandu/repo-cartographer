@@ -74,7 +74,10 @@ anyone, and no delegate gains a view of a directory it has no business in.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.composite import CompositeBackend
@@ -85,6 +88,9 @@ from deepagents.backends.protocol import (
     FileUploadResponse,
     WriteResult,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # Anchored to this file rather than the working directory, for the same reason
 # `agent.py` anchors the workspace and `models.py` anchors its .env: a run
@@ -224,3 +230,131 @@ to every guide whatever the repository is written in, and where it is more
 specific than anything above, it wins.
 
 """
+
+
+# --------------------------------------------------------------------------- #
+# Which skill matches a repository, decided without a model
+# --------------------------------------------------------------------------- #
+#
+# Phase 7 shipped the choice as a model decision: the explorer is shown one line
+# per skill, looks at its file list, and `read_file`s the one that matches. It
+# works, and the trace is good evidence for the phase — but it costs a model
+# request to answer a question that is `"pyproject.toml" in paths`.
+#
+# That is Phase 6's argument arriving somewhere new. A delegate with no model in
+# it beat a delegate with one because checking a path is arithmetic; choosing a
+# skill is the same shape. So the choice moves into Python, the matched skill is
+# spliced into the explorer's prompt before it starts, and the request is not
+# spent. `EXPLORER_PROMPT` keeps the read-it-yourself path for the case below
+# where this function returns None.
+#
+# The markers live here rather than in the SKILL.md frontmatter deliberately.
+# `SkillsMiddleware` skips a skill whose frontmatter does not match the Agent
+# Skills specification, and it skips it *silently* — so an extra key would risk
+# unloading the skill entirely to save this table. The cost is that a new
+# ecosystem needs one entry here as well as its markdown, and
+# `tests/test_skills.py` fails if a skill on disk has no matcher, so that cost
+# cannot be paid by accident.
+
+
+@dataclass(frozen=True)
+class SkillMatcher:
+    """The evidence that a scope belongs to one ecosystem.
+
+    Two tiers, because they carry very different weight. A manifest is decisive
+    — `package.json` means Node whatever else is in the tree — while an
+    extension is only a majority verdict, which is what a scope needs when the
+    manifest sits at the repository root and the explorer was given `src/`.
+    """
+
+    manifests: frozenset[str]
+    extensions: frozenset[str]
+
+    def score(self, paths: Iterable[str]) -> tuple[int, int]:
+        """How strongly `paths` matches, as (manifests present, files matching).
+
+        Ordered so that a plain tuple comparison ranks correctly: any manifest
+        beats any quantity of loose source files, which is the point of the two
+        tiers. A repository with a Python manifest and more JavaScript files than
+        Python ones is still a Python repository to `pyproject.toml`.
+        """
+        manifests: set[str] = set()
+        files = 0
+        for path in paths:
+            name = path.rsplit("/", 1)[-1]
+            if name in self.manifests:
+                manifests.add(name)
+            if any(name.endswith(ext) for ext in self.extensions):
+                files += 1
+        return len(manifests), files
+
+
+SKILL_MATCHERS: dict[str, SkillMatcher] = {
+    "python-repo": SkillMatcher(
+        manifests=frozenset({"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"}),
+        extensions=frozenset({".py", ".pyi"}),
+    ),
+    "node-repo": SkillMatcher(
+        manifests=frozenset({"package.json", "tsconfig.json"}),
+        extensions=frozenset({".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"}),
+    ),
+}
+
+
+def match_skill(paths: Iterable[str]) -> str | None:
+    """The one skill that matches these paths, or None if none clearly does.
+
+    None is a real answer and the common one: a Go repository matches neither
+    skill, and there is nothing to say about it. It also covers the genuinely
+    ambiguous case, where two ecosystems score identically — a tie means the
+    evidence does not name a winner, and inventing one would put the wrong
+    reading order in front of the explorer with the authority of a fact.
+
+    Both of those fall back to the Phase 7 behaviour rather than to nothing: the
+    skills are still mounted and still listed one line each, so the explorer can
+    read whichever it judges relevant. This function only removes the request
+    when the answer was never in doubt.
+    """
+    paths = list(paths)
+    ranked = sorted(
+        ((matcher.score(paths), name) for name, matcher in SKILL_MATCHERS.items()),
+        reverse=True,
+    )
+    if not ranked:
+        return None
+
+    (best, name), rest = ranked[0], ranked[1:]
+    if best == (0, 0):
+        return None
+    if rest and rest[0][0] == best:
+        return None
+    return name
+
+
+@lru_cache(maxsize=len(SKILL_MATCHERS) + 4)
+def skill_body(name: str) -> str:
+    """A skill's markdown with its YAML frontmatter removed. Empty if missing.
+
+    Cached, because `BriefingMiddleware` splices the result into a system prompt
+    on every model call and the file does not change while the process runs —
+    the same assumption `agent.py` makes by reading `AGENTS.md` once at import.
+
+    The frontmatter is `SkillsMiddleware`'s index — a name and a description used
+    to build the one-line menu — and it is addressed to whatever loads the file,
+    not to the agent reading it. Splicing it into a prompt would hand the model a
+    `name:` and a `description:` telling it when to use instructions it is
+    already following.
+    """
+    path = SKILLS_DIR / name / "SKILL.md"
+    if not path.is_file():
+        return ""
+
+    text = path.read_text(encoding="utf-8").strip()
+    if text.startswith("---"):
+        # Partition on the *first* closing fence, which for a file opening with
+        # `---` is the end of the frontmatter — so a `---` horizontal rule later
+        # in the body survives. An empty remainder means there was no closing
+        # fence at all, i.e. this is not frontmatter, and the text stands.
+        _, _, body = text.partition("\n---")
+        text = body or text
+    return text.strip()

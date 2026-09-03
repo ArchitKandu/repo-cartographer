@@ -34,6 +34,7 @@ from repo_cartographer.agent import WORKSPACE, build_subagents
 from repo_cartographer.prompts import DOC_WRITER_PROMPT
 from repo_cartographer.skills import (
     AGENTS_FILE,
+    SKILL_MATCHERS,
     SKILLS_DIR,
     SKILLS_MOUNT,
     ReadOnlyBackend,
@@ -83,6 +84,24 @@ def loaded(backend):
 
 def test_the_skills_on_disk_are_the_ones_we_expect() -> None:
     assert set(available_skills()) == EXPECTED_SKILLS
+
+
+def test_every_skill_on_disk_can_also_be_matched_without_a_model() -> None:
+    """A skill with no matcher never gets injected, and never says so.
+
+    `briefing.py` picks the matching skill in Python and splices it into the
+    explorer's prompt, which is what saves the turn the explorer used to spend
+    reading it. A skill the matcher does not know about still *works* — the mount
+    is still there and the explorer can still read it, exactly as at Phase 7 — so
+    the failure is not a broken run, it is the saving quietly not applying to one
+    ecosystem while applying to the others.
+
+    That is why this is asserted from the directory listing rather than from the
+    matcher table: adding an ecosystem means writing the markdown, and the
+    markdown is the half you can add without touching Python. This is what tells
+    you the other half is missing.
+    """
+    assert set(available_skills()) == set(SKILL_MATCHERS)
 
 
 def test_every_skill_loads_with_no_warnings(loaded) -> None:

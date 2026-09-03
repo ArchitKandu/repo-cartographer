@@ -468,6 +468,7 @@ repo-cartographer/
 │   ├── prompts.py       The three prompts: orchestrator, explorer, doc-writer
 │   ├── middleware.py    Hides the built-ins the orchestrator doesn't use
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
+│   ├── briefing.py      Prefetches the explorer's file list and skill — no LLM code
 │   ├── citations.py     Does this cited path exist? — no LLM code
 │   ├── link_checker.py  The graph around citations.py — a sub-agent with no model
 │   ├── skills.py        Mounts skills/ read-only; loads AGENTS.md
@@ -487,6 +488,7 @@ repo-cartographer/
 ├── tests/
 │   ├── test_tools.py    Live tests against the real GitHub API
 │   ├── test_wiring.py   The four-way split, asserted without a model
+│   ├── test_briefing.py  Is the prefetch right, and do both sides agree? (no model)
 │   ├── test_citations.py  Does the checker catch an invented path? (no model)
 │   ├── test_skills.py   Are the skills found, reachable, and unwritable? (no model)
 │   ├── test_approval.py Is the irreversible action really gated? (no model)

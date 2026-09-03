@@ -91,17 +91,20 @@ def prompt_fingerprint() -> str:
 
     Which makes what is hashed a correctness question rather than a detail.
     Until Phase 7 the instructions were three strings in `prompts.py` and that
-    was the whole set. They are now four kinds of thing: those prompts,
-    `AGENTS.md`, and each `SKILL.md`. Hashing only the prompts would leave the
-    two newest — the ones most likely to be edited, since editing them needs no
-    Python — changing behaviour without ever marking a record stale. That is the
-    exact failure this function exists to prevent, so it covers all of them.
+    was the whole set. They are now five kinds of thing: those prompts,
+    `AGENTS.md`, each `SKILL.md`, and the sections `briefing.py` splices into the
+    explorer's prompt before it starts. Hashing only the prompts would leave the
+    rest changing behaviour without ever marking a record stale — and two of them
+    are the likeliest to be edited of all, `AGENTS.md` and the skills because
+    editing them needs no Python at all. That is the exact failure this function
+    exists to prevent, so it covers all of them.
 
     Imported here rather than at module scope so `--history` still works with no
     provider key: `prompts.py` and `skills.py` pull in nothing heavy, but keeping
     every agent import inside a function makes that a property of the file rather
     than a fact to re-verify.
     """
+    from repo_cartographer.briefing import briefing_sections
     from repo_cartographer.prompts import (
         DOC_WRITER_PROMPT,
         EXPLORER_PROMPT,
@@ -110,6 +113,13 @@ def prompt_fingerprint() -> str:
     from repo_cartographer.skills import SKILLS_DIR, available_skills, house_style
 
     parts = [ORCHESTRATOR_PROMPT, EXPLORER_PROMPT, DOC_WRITER_PROMPT, house_style()]
+    # The fifth kind, and the least obvious: `briefing.py` splices two sections
+    # into the explorer's prompt at run time — its file list, and the skill that
+    # matched. Rewording them changes what the explorer was told just as surely
+    # as editing `EXPLORER_PROMPT` does, and it is the kind of edit that looks
+    # like a code change rather than an instruction change, so it would be the
+    # easiest one to make while every recorded score kept reading as current.
+    parts += briefing_sections()
     # Sorted, so the digest depends on the skills' content and not on the order
     # the filesystem happened to list them in.
     parts += [

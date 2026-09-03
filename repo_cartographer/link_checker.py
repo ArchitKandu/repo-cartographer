@@ -70,8 +70,20 @@ DEFAULT_GUIDE_PATH = "/guide.md"
 
 # `owner=psf repo=requests` first, because it is unambiguous and the
 # orchestrator prompt asks for exactly this form.
-_KEYED_OWNER = re.compile(r"owner\s*[=:]\s*([A-Za-z0-9][\w.-]*)", re.IGNORECASE)
-_KEYED_REPO = re.compile(r"repo(?:sitory)?\s*[=:]\s*([A-Za-z0-9][\w.-]*)", re.IGNORECASE)
+#
+# The optional quote is not decoration: a model that has been asked for
+# `owner=<owner>` sometimes writes `owner="psf"`, and without it the value starts
+# at a character the class rejects, so the whole keyed form misses and the parse
+# falls through to the prose slug. The closing quote needs no pattern — it is not
+# in `[\w.-]`, so the capture stops there on its own.
+#
+# Shared with `briefing.py`, which reads the explorer's brief for the same two
+# fields. One convention, one parser: two would drift, and both are reading
+# something a model wrote to a format described in one prompt.
+_KEYED_OWNER = re.compile(r"""owner\s*[=:]\s*["'`]?([A-Za-z0-9][\w.-]*)""", re.IGNORECASE)
+_KEYED_REPO = re.compile(
+    r"""repo(?:sitory)?\s*[=:]\s*["'`]?([A-Za-z0-9][\w.-]*)""", re.IGNORECASE
+)
 
 # ...and `psf/requests` as written in prose, as the fallback. Not preceded by a
 # slash or a word character, so `/notes/src.md` and `src/requests` cannot be read

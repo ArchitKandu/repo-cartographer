@@ -66,6 +66,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
+from repo_cartographer.briefing import BriefingMiddleware
 from repo_cartographer.link_checker import (
     DEFAULT_GUIDE_PATH,
     LINK_CHECKER_DESCRIPTION,
@@ -193,6 +194,18 @@ def build_subagents(
             # that no longer need it and absent from the one that does.
             tool_token_limit_before_evict=tool_result_token_limit,
         ),
+        # Two of the explorer's turns were never spent on reading code: one on
+        # `get_repo_tree` to find out what was in its scope, one on `read_file`
+        # to fetch the skill it had just recognised. Neither question needs a
+        # model — a scope is a filter over a list, and a skill matches on a
+        # filename — so both are answered in Python before the first turn and
+        # spliced into this agent's prompt. Three explorers, six requests, on a
+        # budget of fifteen a minute.
+        #
+        # It is a pure optimisation and holds no invariant: every path through it
+        # can decline to inject, and `EXPLORER_PROMPT` still describes doing the
+        # work by hand. See `briefing.py` for what makes it decline.
+        BriefingMiddleware(),
     ]
     doc_writer_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         FilesystemMiddleware(
