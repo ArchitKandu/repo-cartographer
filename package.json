@@ -6,11 +6,19 @@
     "frontend"
   ],
   "scripts": {
+    "setup": "bash setup.sh",
+    "doctor": "cd backend && uv run scripts/check_env.py",
+    "dev": "concurrently --names api,web --prefix-colors cyan,magenta \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "cd backend && uv run python serve.py --reload",
     "dev:web": "npm run dev --workspace frontend",
-    "dev:api": "cd backend && uv run uvicorn repo_cartographer.api:app --reload",
+    "start:api": "cd backend && uv run python serve.py",
     "build:web": "npm run build --workspace frontend",
     "lint:web": "npm run lint --workspace frontend",
     "lint:api": "cd backend && uv run ruff check . && uv run mypy",
-    "test:api": "cd backend && uv run pytest -q"
+    "test:api": "cd backend && uv run pytest -q",
+    "migrate": "cd backend && uv run scripts/apply_migrations.py"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
   }
 }

@@ -261,12 +261,45 @@ again. Phase 5 is where that turned out to matter; see
   which to use when.
 - **A GitHub personal access token** — read-only on public repos is enough.
 
+Additionally, for the web application (the CLI needs none of these):
+
+- **Node.js 20 or newer** and npm, for the Next.js frontend.
+- **A [Supabase](https://supabase.com) project** — free tier. It supplies three
+  separate things: Postgres for durable run state, Auth for sign-in, and later
+  Storage for finished guides.
+
 ---
 
 ## Setup
 
-The steps are the same on every OS; only installing `uv` and creating the `.env`
-file differ. Pick your platform for those two.
+### Quick start
+
+One script does all of it — installs both halves, creates the env files from
+their templates, applies the database migrations, and then **connects to
+everything it just configured to check that the values actually work**:
+
+```bash
+./setup.sh              # macOS, Linux, or Git Bash on Windows
+```
+
+```powershell
+.\setup.ps1             # Windows PowerShell
+```
+
+Both are safe to run repeatedly: env files are only created when missing, and the
+migrations are written to be applied twice. Add `--check` (or `-Check`) to change
+nothing and just report what is ready.
+
+It exits non-zero if anything required is missing, and names it. To re-run only
+the checks later:
+
+```bash
+npm run doctor
+```
+
+The rest of this section is what that script does, for when you would rather do
+it by hand or something went wrong. The steps are the same on every OS; only
+installing `uv` and creating the `.env` file differ.
 
 ### 1. Install uv
 
@@ -379,9 +412,42 @@ your hourly quota is spent — an environment problem is not a bug in the code.
 
 ## Running it
 
-Ask your own question:
+There are two ways to use this: as a CLI, which needs nothing but a model key,
+and as a web application, which needs the database and Supabase Auth as well.
+
+### The web application
+
+From the repository root:
 
 ```bash
+npm run dev        # both halves at once
+```
+
+```bash
+npm run dev:api    # just the API,  http://localhost:8000
+npm run dev:web    # just the app,  http://localhost:3000
+```
+
+> **Windows: do not start the API with `uvicorn repo_cartographer.api:app`.**
+> Uvicorn selects its event loop with a factory rather than asyncio's policy, and
+> on Windows that factory returns a `ProactorEventLoop`, which psycopg cannot use
+> in async mode. Every database connection fails, the pool retries each failure
+> silently, and thirty seconds later the server exits with `PoolTimeout` naming
+> neither the loop nor the database. `backend/serve.py` — which is what
+> `npm run dev:api` runs — chooses a compatible loop itself. The API also detects
+> the bad loop at startup now and says so immediately rather than timing out.
+>
+> The confusing part, and the reason this is worth a warning: the same factory
+> returns a *working* loop whenever uvicorn uses a subprocess, which `--reload`
+> does. So the plain command works in development and fails the moment someone
+> drops `--reload` to run it for real. Linux is unaffected either way.
+
+### The CLI
+
+No database, no Supabase, no frontend — just a model key and a GitHub token:
+
+```bash
+cd backend
 uv run main.py "Explore pallets/flask and explain how routing works."
 ```
 

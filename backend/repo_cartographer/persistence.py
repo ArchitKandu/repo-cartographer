@@ -137,6 +137,26 @@ async def connected() -> AsyncIterator[tuple[AsyncConnectionPool, AsyncPostgresS
             "which resolves on IPv6 only and is unreachable from most hosts."
         ) from None
 
+    # A Proactor loop here is fatal, and fatal in the least helpful way available:
+    # psycopg raises `InterfaceError` on every connection attempt, the pool
+    # swallows each one and retries, and thirty seconds later the caller gets
+    # `PoolTimeout: couldn't get a connection after 30.00 sec` naming nothing.
+    #
+    # The policy set at import cannot prevent this under a server. Uvicorn selects
+    # its loop with a *factory* rather than the policy — `asyncio_loop_factory`
+    # returns `ProactorEventLoop` on Windows — so the policy is simply not
+    # consulted. Checking the loop actually running is the only thing that holds
+    # whoever started us. See `serve.py`, which is the supported way in.
+    running = asyncio.get_running_loop()
+    if sys.platform == "win32" and type(running).__name__ == "ProactorEventLoop":
+        raise RuntimeError(
+            "This is running on Windows' ProactorEventLoop, which psycopg cannot "
+            "use in async mode — every database connection would fail and the pool "
+            "would hide it behind a 30-second timeout. "
+            "Start the API with `uv run python serve.py` (or `uvicorn ... --reload`, "
+            "which happens to select a compatible loop). Linux is unaffected."
+        )
+
     async with AsyncConnectionPool(
         conninfo=uri,
         # `min_size` is stated because psycopg's default is 4, which both holds
