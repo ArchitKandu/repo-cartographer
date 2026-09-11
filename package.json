@@ -1,0 +1,16 @@
+{
+  "name": "repo-cartographer",
+  "private": true,
+  "description": "Monorepo root. The Python agent and API live in backend/; the Next.js app in frontend/.",
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace frontend",
+    "dev:api": "cd backend && uv run uvicorn repo_cartographer.api:app --reload",
+    "build:web": "npm run build --workspace frontend",
+    "lint:web": "npm run lint --workspace frontend",
+    "lint:api": "cd backend && uv run ruff check . && uv run mypy",
+    "test:api": "cd backend && uv run pytest -q"
+  }
+}

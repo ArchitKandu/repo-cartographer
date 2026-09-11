@@ -4,6 +4,7 @@
 code and writes you an onboarding guide.**
 
 ```console
+$ cd backend
 $ uv run main.py "Explore psf/requests and explain its architecture: what the main
   modules are, where the Session object is defined, and how requests.get ends up
   sending an HTTP request."
@@ -106,7 +107,7 @@ model invent them.
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | How it works, from scratch — the agents, the files, one real run traced step by step, and the fifteen decisions that *are* the architecture. Assumes no prior knowledge of the codebase |
 | **[BUILD_LOG.md](BUILD_LOG.md)** | What each phase isolated, and the measurement that showed it worked |
 | **[IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md)** | The plan the phases follow, and why they are ordered that way |
-| **[AGENTS.md](AGENTS.md)** | House style for the guides the agent writes — editable without touching Python |
+| **[AGENTS.md](backend/AGENTS.md)** | House style for the guides the agent writes — editable without touching Python |
 
 ---
 
@@ -171,7 +172,7 @@ there. Every agent gets a deliberately narrow set:
 | link-checker | `get_repo_tree`, in Python | reads `/guide.md` directly | **no tools — it has no model to offer them to** |
 
 Two mechanisms produce that table, and they are not interchangeable.
-[`middleware.py`](repo_cartographer/middleware.py) hides tools from the
+[`middleware.py`](backend/repo_cartographer/middleware.py) hides tools from the
 orchestrator per model request — the tool node still holds them, the model is just
 never told. Each sub-agent instead restates `FilesystemMiddleware(tools=[...])` in
 its own spec, which is stronger: an excluded tool is never constructed, so it
@@ -191,7 +192,7 @@ Both halves of the table are deliberate:
 - **`write_todos` is added.** It comes from `TodoListMiddleware`, passed
   explicitly — as of deepagents 0.7.3 planning is *not* in the default middleware
   stack. Mapping a repo is several steps deep, so
-  [`ORCHESTRATOR_PROMPT`](repo_cartographer/prompts.py) asks for a todo list before
+  [`ORCHESTRATOR_PROMPT`](backend/repo_cartographer/prompts.py) asks for a todo list before
   the first tool call, and the agent writes one.
 - **Six built-ins are taken away from the orchestrator.** `create_deep_agent` also
   supplies `glob`, `grep`, `delete` and a shell (`execute`); none has anything to
@@ -209,7 +210,7 @@ Both halves of the table are deliberate:
   having "all tools as the main agent" — which, now that the orchestrator holds
   none, means none. A delegate that can do nothing, described as the one that can
   do anything. A `HarnessProfile` registered against the active model removes it;
-  the key is built in [`models.py`](repo_cartographer/models.py) because its shape
+  the key is built in [`models.py`](backend/repo_cartographer/models.py) because its shape
   differs per provider, and a key that fails to match doesn't raise — it silently
   leaves the default in place, which is why a test asserts the menu instead of
   trusting the call.
@@ -460,56 +461,55 @@ print(get_file_contents("pallets", "flask", "pyproject.toml"))
 
 ## Project layout
 
+Two applications in one repository. The split is along the only line that
+matters here — the Python agent and its HTTP surface on one side, the browser app
+on the other — and it is a directory boundary rather than two repositories
+because the two are developed together and a change to the API usually implies a
+change to the page that calls it.
+
+**Every `uv run ...` command in this README runs from `backend/`.** The Python
+project anchors its paths to its own root (`skills/`, `AGENTS.md`, `workspace/`,
+`.env` are all found relative to the package), so `backend/` is a complete,
+self-contained Python project and nothing above it is on its path.
+
 ```
 repo-cartographer/
-├── repo_cartographer/
-│   ├── __init__.py      Package docstring; re-exports the GitHub tools
-│   ├── agent.py         build_agent(), build_subagents(), ask() — the wiring
-│   ├── prompts.py       The three prompts: orchestrator, explorer, doc-writer
-│   ├── middleware.py    Hides unused built-ins; turns tool errors into messages
-│   ├── models.py        Provider selection (Google / OpenRouter), .env loading
-│   ├── briefing.py      Prefetches the explorer's file list and skill — no LLM code
-│   ├── citations.py     Does this cited path exist? — no LLM code
-│   ├── link_checker.py  The graph around citations.py — a sub-agent with no model
-│   ├── skills.py        Mounts skills/ read-only; loads AGENTS.md
-│   ├── pull_requests.py The one irreversible action, behind two guards
-│   └── tools.py         Four GitHub API functions — all reads, no LLM code
-├── skills/
-│   ├── python-repo/SKILL.md   Read only when the repo is Python
-│   └── node-repo/SKILL.md     Read only when the repo is JS/TS
-├── AGENTS.md            House style — appended to the doc-writer every run
-├── scripts/
-│   ├── measure_context.py   Phase 3's A/B: offloading on vs. off
-│   ├── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
-│   ├── run_evals.py         Phase 5: six repos in, one score out
-│   ├── prove_link_checker.py  Phase 6: plant a fake path, watch it get caught
-│   ├── show_models.py       Which agent runs on which model, and on whose budget
-│   ├── show_skills.py       Phase 7: a Python repo and a JS repo, back to back
-│   └── prove_approval_gate.py  Phase 8: trigger the gate, watch it stop
-├── tests/
-│   ├── test_tools.py    Live tests against the real GitHub API
-│   ├── test_wiring.py   The four-way split, asserted without a model
-│   ├── test_briefing.py  Is the prefetch right, and do both sides agree? (no model)
-│   ├── test_models.py   Which agent gets which model, and which budget? (no model)
-│   ├── test_middleware.py  Does a 404 reach the model instead of ending the run?
-│   ├── test_citations.py  Does the checker catch an invented path? (no model)
-│   ├── test_skills.py   Are the skills found, reachable, and unwritable? (no model)
-│   ├── test_approval.py Is the irreversible action really gated? (no model)
-│   ├── test_evals.py    Is the eval set itself true? (live GitHub, no model)
-│   └── evals/
-│       ├── known_repos.jsonl   The dataset: 6 repos, 31 expected facts
-│       ├── dataset.py          Loads and validates it, strictly
-│       ├── scoring.py          Is this fact in this guide? No model involved
-│       └── results/            Recorded runs — git-ignored
-├── workspace/           The agent's scratch space — git-ignored, run output
-├── main.py              CLI: uv run main.py "your question"
-├── .env.example         Template for your keys — copy to .env
+├── backend/             The agent, the tools, and the FastAPI service
+│   ├── repo_cartographer/
+│   │   ├── agent.py         build_agent(), build_subagents(), ask() — the wiring
+│   │   ├── prompts.py       The three prompts: orchestrator, explorer, doc-writer
+│   │   ├── middleware.py    Hides unused built-ins; turns tool errors into messages
+│   │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
+│   │   ├── briefing.py      Prefetches the explorer's file list and skill — no LLM code
+│   │   ├── citations.py     Does this cited path exist? — no LLM code
+│   │   ├── link_checker.py  The graph around citations.py — a sub-agent with no model
+│   │   ├── skills.py        Mounts skills/ read-only; loads AGENTS.md
+│   │   ├── workspaces.py    One scratch directory per run, keyed by thread_id
+│   │   ├── persistence.py   Postgres checkpointing — a pause that outlives the process
+│   │   ├── runs.py          The runs table: who asked what, and where it got to
+│   │   ├── auth.py          Verifies a Supabase token against the cached JWKS
+│   │   ├── api.py           The HTTP surface: start a run, poll it, answer its gate
+│   │   ├── pull_requests.py The one irreversible action, behind two guards
+│   │   └── tools.py         Four GitHub API functions — all reads, no LLM code
+│   ├── skills/          Loaded only when the repository matches the ecosystem
+│   ├── db/              SQL migrations, applied in filename order
+│   ├── scripts/         The proofs — each runs the real thing and reports
+│   ├── tests/           253 tests; the fast ones need no model and no network
+│   ├── AGENTS.md        House style — appended to the doc-writer every run
+│   ├── workspace/       Scratch space, one directory per run — git-ignored
+│   ├── main.py          CLI: uv run main.py "your question"
+│   ├── .env             Your keys — git-ignored; see .env.example
+│   ├── langgraph.json   Graph entry point for LangGraph Studio / Platform
+│   ├── pyproject.toml   Dependencies, plus the ruff and mypy configuration
+│   └── uv.lock          Exact pinned versions
+├── frontend/            Next.js app — sign in, ask, watch, approve
+│   ├── src/
+│   ├── .env.local       Supabase URL and publishable key — git-ignored
+│   └── package.json
+├── package.json         Monorepo root: workspaces and the dev/lint/test scripts
 ├── ARCHITECTURE.md      How the whole system works, start to finish
 ├── BUILD_LOG.md         What each phase proved, and how it was measured
-├── IMPLEMENTATION_GUIDE.md   The phased build plan
-├── langgraph.json       Graph entry point for LangGraph Studio / Platform
-├── pyproject.toml       Dependencies, plus the ruff and mypy configuration
-└── uv.lock              Exact pinned versions
+└── IMPLEMENTATION_GUIDE.md   The phased build plan
 ```
 
 **Two boundaries run through that tree, and they are the reason it is shaped this
@@ -694,7 +694,7 @@ to read, writes the notes everything downstream rests on, and spends more
 requests than the other two together.
 
 `ASSIST_MODEL` and `ASSIST_ROLES` in `.env` move that line if you want to; see
-[`.env.example`](.env.example) for the trade, and measure with `run_evals.py`
+[`.env.example`](backend/.env.example) for the trade, and measure with `run_evals.py`
 rather than by reading one answer. To see the routing as it stands:
 
 ```bash
@@ -765,7 +765,7 @@ the workspace tools outright; Phase 3 gave them back, so what keeps the model fr
 repeating that mistake is the prompts drawing the line between a remote read-only
 repository and a local workspace that starts empty — a weaker guarantee than
 removal, and the reason the distinction is stated twice in both
-[`ORCHESTRATOR_PROMPT` and `EXPLORER_PROMPT`](repo_cartographer/prompts.py).
+[`ORCHESTRATOR_PROMPT` and `EXPLORER_PROMPT`](backend/repo_cartographer/prompts.py).
 
 Phase 4 narrows the opening again from a different direction: the only agent that
 can reach GitHub now holds just `read_file` and `write_file` on the workspace, and

@@ -182,7 +182,7 @@ Two explorers and an orchestrator stepping through their own tool loops reached
 15 requests/minute in seconds. The API's own advice — *retry in 1 second* — is the
 tell: this is a pacing problem, not a capacity one, so the fix is a client-side
 rate limiter rather than fewer explorers.
-[`models.py`](repo_cartographer/models.py) attaches one `InMemoryRateLimiter` to
+[`models.py`](backend/repo_cartographer/models.py) attaches one `InMemoryRateLimiter` to
 the single chat model at 80% of the tier's published limit. Because every
 sub-agent inherits that model *instance*, all four agents draw from one bucket —
 which is the only correct arrangement, since the provider's limit is per project,
@@ -287,7 +287,7 @@ error it can read and route around, exactly as the prompts promise ("a failed
 tool call is information"), but a raw `requests.ReadTimeout` escaped the agent
 loop and ended the run. One dropped packet, and a whole mapping was gone.
 
-[`tools.py`](repo_cartographer/tools.py) now routes every call through one
+[`tools.py`](backend/repo_cartographer/tools.py) now routes every call through one
 helper that retries transport failures three times with a growing pause — and
 only transport failures, never an HTTP answer, because a 404 will not become a
 200 and a 403 from the search quota gets worse if you ask again. When the retries

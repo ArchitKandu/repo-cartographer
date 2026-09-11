@@ -17,17 +17,25 @@ wheels/
 
 # Environment variables
 .env
+.env.local
 
 # Agent scratch space: the workspace the filesystem backend writes notes into.
-# Run output, not source — regenerated on every run.
+# Run output, not source — regenerated on every run. One directory per run
+# since `workspaces.py`, so this grows until the prune job runs.
 tmp/
-workspace/
+backend/workspace/
 
 # Recorded eval runs. Each file is a log of guides the agent produced for one
 # case, written by scripts/run_evals.py and re-scored for free by --score-only.
 # Machine-local by design: they are measurements of one machine's runs against
 # one model, and committing them would invite reading a stale number as current.
-tests/evals/results/
+backend/tests/evals/results/
 
 .agents/
 .claude/
+
+# Node / Next.js (frontend)
+node_modules/
+.next/
+out/
+next-env.d.ts
