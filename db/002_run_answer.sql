@@ -1,0 +1,15 @@
+-- The agent's final answer, kept on the row.
+--
+-- 001 assumed every run produces a guide file and that `guide_path` was
+-- therefore the whole deliverable. The first end-to-end run through the API
+-- disproved it: asked to explain a repository rather than to document it, the
+-- orchestrator answered in prose and wrote no file, so the run finished `done`
+-- with nothing anywhere for the client to read. The answer had been produced and
+-- then dropped on the floor.
+--
+-- Stored rather than read back out of the checkpoint on demand, which was the
+-- other option and is tempting because the message is already there. Checkpoints
+-- are prunable — they are the bulk of what a mapping run costs in storage, and
+-- the plan is to delete them once a run reaches a terminal state. The row is what
+-- survives that, so the durable answer belongs on the row.
+alter table public.runs add column if not exists answer text;

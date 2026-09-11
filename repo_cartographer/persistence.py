@@ -111,8 +111,13 @@ async def _configure(conn: psycopg.AsyncConnection[Any]) -> None:
 
 
 @asynccontextmanager
-async def checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
-    """A Postgres-backed saver and the connection pool underneath it.
+async def connected() -> AsyncIterator[tuple[AsyncConnectionPool, AsyncPostgresSaver]]:
+    """The connection pool and the saver built on it.
+
+    Both, because a web application needs both and only one of them is the
+    checkpointer's business. `AsyncPostgresSaver` does happen to keep the pool on
+    a public `.conn`, but reading it back off the library is a guess about an
+    implementation detail; handing it over explicitly is not.
 
     A context manager because the pool is a resource with a lifetime: it opens
     connections eagerly and must be closed, which in a web application means
@@ -150,4 +155,15 @@ async def checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
             )
         saver = AsyncPostgresSaver(pool)
         await saver.setup()
+        yield pool, saver
+
+
+@asynccontextmanager
+async def checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
+    """Just the saver, for callers that only run a graph.
+
+    The common case, and the one the scripts use — `connected()` is for the API,
+    which also has a `runs` table to write.
+    """
+    async with connected() as (_pool, saver):
         yield saver
