@@ -42,13 +42,21 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 # scripts/ is not a package and the repo root is not on sys.path when this file
 # is run directly — pyproject's `pythonpath = ["."]` covers pytest, not this.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from repo_cartographer.agent import RECURSION_LIMIT, WORKSPACE, agent
+# Windows hands Python a cp1252 stdout, which cannot encode the box-drawing
+# characters used to quote the verdict below. Without this the script does all
+# three steps and then dies printing the result it just worked for.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+from repo_cartographer.agent import WORKSPACE, agent, run_config
 from repo_cartographer.link_checker import DEFAULT_GUIDE_PATH
+from repo_cartographer.workspaces import workspace_for
 
 OWNER, REPO = "psf", "requests"
 
@@ -130,17 +138,28 @@ def clear_workspace() -> None:
 def run() -> int:
     print(f"Planting a fake path in the notes: {FAKE_PATH}\n")
     clear_workspace()
-    notes = WORKSPACE / NOTES_PATH.lstrip("/")
+
+    # A thread id, and the same one for both sub-agents below. Workspaces became
+    # per-run in `workspaces.py`, so the directory the planted notes belong in is
+    # no longer `./workspace` itself but this run's directory inside it. A
+    # sub-agent invoked without a thread would resolve a different (empty) one and
+    # report that the notes had vanished. Planting through the same id the agents
+    # will resolve is what keeps the whole script pointed at one workspace.
+    thread = str(uuid4())
+    run_dir = workspace_for(WORKSPACE, thread)
+    config = run_config(thread)
+
+    notes = run_dir / NOTES_PATH.lstrip("/")
     notes.parent.mkdir(parents=True, exist_ok=True)
     notes.write_text(POISONED_NOTES, encoding="utf-8")
 
     print("1. running the real doc-writer over the poisoned notes …")
     result = subagent("doc-writer").invoke(
         {"messages": [{"role": "user", "content": DOC_WRITER_BRIEF}]},
-        config={"recursion_limit": RECURSION_LIMIT},
+        config=config,
     )
     guide = result["messages"][-1].text
-    written = WORKSPACE / DEFAULT_GUIDE_PATH.lstrip("/")
+    written = run_dir / DEFAULT_GUIDE_PATH.lstrip("/")
     print(f"   guide returned: {len(guide)} chars")
     print(f"   guide on disk:  {'yes' if written.exists() else 'NO — it wrote nothing'}\n")
 
@@ -157,9 +176,10 @@ def run() -> int:
     print(f"   YES — it cites {FAKE_PATH}, exactly as an explorer's mistake would carry.\n")
 
     print("3. running the real link-checker over the guide it wrote …\n")
-    verdict = subagent("link-checker").invoke(
-        {"messages": [{"role": "user", "content": CHECKER_BRIEF}]}
-    )["messages"][-1].text
+    checked = subagent("link-checker").invoke(
+        {"messages": [{"role": "user", "content": CHECKER_BRIEF}]}, config=config
+    )
+    verdict = checked["messages"][-1].text
     print("\n".join(f"   │ {line}" for line in verdict.splitlines()))
 
     flagged = FAKE_PATH in verdict and "NOT FOUND" in verdict

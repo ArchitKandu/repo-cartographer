@@ -89,6 +89,8 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 
+from repo_cartographer.workspaces import ThreadScopedBackend
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -186,7 +188,12 @@ def build_backend(workspace: Path) -> BackendProtocol:
     with the same tool it uses for everything else.
     """
     return CompositeBackend(
-        default=FilesystemBackend(root_dir=workspace),
+        # Thread-scoped rather than a plain `FilesystemBackend`: the argument names
+        # the directory runs live *under*, and each run gets its own inside it. See
+        # `workspaces.py` — the short version is that every path in `prompts.py` is
+        # a fixed convention, so two concurrent runs do not collide by bad luck,
+        # they collide by design.
+        default=ThreadScopedBackend(root_dir=workspace),
         routes={SKILLS_MOUNT: ReadOnlyBackend(root_dir=SKILLS_DIR)},
     )
 
