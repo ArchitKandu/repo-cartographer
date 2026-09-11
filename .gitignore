@@ -28,3 +28,6 @@ workspace/
 # Machine-local by design: they are measurements of one machine's runs against
 # one model, and committing them would invite reading a stale number as current.
 tests/evals/results/
+
+.agents/
+.claude/

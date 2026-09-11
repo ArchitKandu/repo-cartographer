@@ -63,6 +63,7 @@ from deepagents.profiles import (
 )
 from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
@@ -324,7 +325,9 @@ def build_subagents(
 
 
 def build_agent(
-    *, tool_result_token_limit: int | None = TOOL_RESULT_TOKEN_LIMIT
+    *,
+    tool_result_token_limit: int | None = TOOL_RESULT_TOKEN_LIMIT,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> CompiledStateGraph:
     """Build a cartographer. The one argument is Phase 3's variable.
 
@@ -431,8 +434,15 @@ def build_agent(
         # crash: pausing means writing the run's state somewhere it can be picked
         # up again, and `interrupt()` raises without a checkpointer to write to.
         # In-memory because a paused run here is resumed seconds later by the same
-        # process; a deployment that survives a restart wants a real one.
-        checkpointer=InMemorySaver(),
+        # process; a deployment that survives a restart passes a real one.
+        #
+        # A parameter rather than a constant, and defaulted rather than required,
+        # because those two callers want opposite things. `uv run main.py` should
+        # not need a database to answer a question, so the default keeps the CLI
+        # and the test suite working with no configuration at all. A server, whose
+        # approval gate spans two requests and whose process may not survive
+        # between them, passes `repo_cartographer.persistence.checkpointer()`.
+        checkpointer=checkpointer or InMemorySaver(),
     )
 
 
