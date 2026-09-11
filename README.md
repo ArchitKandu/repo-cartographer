@@ -466,7 +466,7 @@ repo-cartographer/
 │   ├── __init__.py      Package docstring; re-exports the GitHub tools
 │   ├── agent.py         build_agent(), build_subagents(), ask() — the wiring
 │   ├── prompts.py       The three prompts: orchestrator, explorer, doc-writer
-│   ├── middleware.py    Hides the built-ins the orchestrator doesn't use
+│   ├── middleware.py    Hides unused built-ins; turns tool errors into messages
 │   ├── models.py        Provider selection (Google / OpenRouter), .env loading
 │   ├── briefing.py      Prefetches the explorer's file list and skill — no LLM code
 │   ├── citations.py     Does this cited path exist? — no LLM code
@@ -483,12 +483,15 @@ repo-cartographer/
 │   ├── show_contexts.py     Phase 4: per-agent context, via subgraphs=True
 │   ├── run_evals.py         Phase 5: six repos in, one score out
 │   ├── prove_link_checker.py  Phase 6: plant a fake path, watch it get caught
+│   ├── show_models.py       Which agent runs on which model, and on whose budget
 │   ├── show_skills.py       Phase 7: a Python repo and a JS repo, back to back
 │   └── prove_approval_gate.py  Phase 8: trigger the gate, watch it stop
 ├── tests/
 │   ├── test_tools.py    Live tests against the real GitHub API
 │   ├── test_wiring.py   The four-way split, asserted without a model
 │   ├── test_briefing.py  Is the prefetch right, and do both sides agree? (no model)
+│   ├── test_models.py   Which agent gets which model, and which budget? (no model)
+│   ├── test_middleware.py  Does a 404 reach the model instead of ending the run?
 │   ├── test_citations.py  Does the checker catch an invented path? (no model)
 │   ├── test_skills.py   Are the skills found, reachable, and unwritable? (no model)
 │   ├── test_approval.py Is the irreversible action really gated? (no model)
@@ -662,6 +665,53 @@ automatically.
 | Requests/minute | 15 | 20 |
 | Mapping runs/day | ~50 | ~5 |
 | Best for | iterating on the prompt | runs whose output matters |
+
+### Set both keys, and one agent moves off the busy budget
+
+The limits above are published **per model** — Google's usage dashboard reports
+one row per model name — so a second model is a second budget. With keys for both
+providers set, `models.py` uses that: the orchestrator and the explorers stay on
+the primary, and the **doc-writer** runs on the other provider's model. Nothing
+to configure; one key means everything stays on one model, as before.
+
+It is capacity, not a saving. No request is removed; roughly five of a run's
+thirty stop competing with the fan-out for the same fifteen-a-minute bucket.
+
+Which agent moves is the whole decision, and the doc-writer is chosen because it
+is the only one whose failure mode this system already guards twice:
+
+- Phase 4 took away its repository access entirely (`tools=[]`), so it cannot
+  cite a file nobody read — only write prose about files the notes name.
+- Phase 6 put a check with no model in it between that prose and the answer, and
+  the check is arithmetic.
+
+So a weaker model in that seat writes worse sentences. It does not get to invent
+a file, and if it tries, the link-checker says so. The other two have no such
+guard: a weaker orchestrator stops emitting parallel tool calls, writes a brief
+the prefetch cannot read, or summarises the guide instead of relaying it — three
+regressions that never raise and read as a normal run. The explorer decides what
+to read, writes the notes everything downstream rests on, and spends more
+requests than the other two together.
+
+`ASSIST_MODEL` and `ASSIST_ROLES` in `.env` move that line if you want to; see
+[`.env.example`](.env.example) for the trade, and measure with `run_evals.py`
+rather than by reading one answer. To see the routing as it stands:
+
+```bash
+uv run scripts/show_models.py
+```
+
+**Retries are capped at 2** (`MODEL_MAX_RETRIES`). `langchain-google-genai`
+defaults to six, and each one is a real request the provider counts — against the
+per-minute limit that caused the rejection, and against the per-day limit that
+had nothing to do with it. It is how one bad minute takes a chunk out of a whole
+day, and why a dashboard can read 17 requests in a minute against a limiter set
+to 12.
+
+**Not `openrouter/free`.** It is a real model id that picks a free model at random
+per request, so no two runs are comparable — which breaks Phase 2's definition of
+done and every eval score, both of which compare runs. Pin a specific free model
+instead; `models.py` lists the candidates.
 
 **Watch Gemini's per-model daily caps.** They are not uniform, and reaching for a
 bigger model costs you the ability to run at all:

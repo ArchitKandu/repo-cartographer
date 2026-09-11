@@ -233,7 +233,7 @@ lets a graph call one.
 | File | What lives there | Why it is separate |
 |---|---|---|
 | `tools.py` | `get_repo_tree`, `get_file_contents`, `search_code`, `get_repo_scopes` | The one deterministic layer. No AI code at all, so it can be tested for real against GitHub — 26 live tests, zero mocking |
-| `models.py` | Which model, which provider, and the shared request queue | Changing models should never mean editing the agent |
+| `models.py` | Which model each role gets, which provider, and one request queue per model | Changing models should never mean editing the agent. Since the limits are published per model, a second model is a second budget — so this is also where the doc-writer is routed off the fan-out's bucket |
 | `prompts.py` | `ORCHESTRATOR_PROMPT`, `EXPLORER_PROMPT`, `DOC_WRITER_PROMPT` | Content, not wiring. Three prompts inline would bury the 20-line graph definition they surround. Three prompts, four agents — the link-checker has no model to instruct |
 | `middleware.py` | `RestrictToolsMiddleware` | Hides built-in tools from the orchestrator per model request |
 | `citations.py` | `check_citations`, `cited_paths` | The second deterministic layer. Decides whether a cited path exists, with no model and no agent code, so the verdict is a fact. Testable with a list of strings |
@@ -575,10 +575,28 @@ conversation would hit a hard wall.
 
 ### And concurrency buys no speed here
 
-The free tier allows **15 requests per minute for the whole project**. Two
+The free tier allows **15 requests per minute on the model the fan-out uses.** Two
 explorers plus an orchestrator, each stepping through its own tool loop, reach that
-in seconds. So `models.py` paces every request through one shared queue at 80% of
-the published limit.
+in seconds. So `models.py` paces every request through a queue at 80% of the
+published limit — **one queue per model, not one per run.** Agents sharing a model
+share a bucket, because the provider counts their requests together; agents on
+different models get their own, because the limits are published per model name.
+Google's own usage dashboard reports it that way: one row, and one set of
+RPM/TPM/RPD figures, per model.
+
+That is what makes a second model worth having, and it is capacity rather than a
+saving — no request is removed, one agent's requests are moved somewhere they are
+not competing with the fan-out. The doc-writer is the one that moves, and
+`models.py` argues the choice at length. Briefly: it is the only agent whose
+failure mode this system already guards twice, because Phase 4 took away its
+repository access and Phase 6 checks its citations with no model in the loop. A
+weaker model there writes worse sentences; it does not get to invent a file. The
+orchestrator and the explorer stay, because their regressions are the silent ones
+— parallel dispatch that stops being parallel, a brief the prefetch cannot read,
+a guide summarised instead of relayed.
+
+`scripts/show_models.py` prints the routing, the per-model budgets and the retry
+cap without making a request.
 
 Which means the explorers run "in parallel" but finish no sooner than the queue
 lets them through. **On a per-minute request budget, concurrency buys separate
@@ -630,13 +648,35 @@ four of six repositories:
 ```
 
 Not the model, not a rate limit — the connection to GitHub dropping. The reason it
-was fatal is an asymmetry four phases of single runs never surfaced: `GitHubError`
-and `ValueError` from the tools layer reach the model as a tool error it can read
-and route around, exactly as the prompts promise, but a raw `requests.ReadTimeout`
-escaped the agent loop and ended the run. `tools.py` now retries transport
-failures — and only transport failures, never an HTTP answer — then raises
-`GitHubError`, so a dropped connection is the same kind of event as a 404. Same
-four cases, unchanged, on the retry: 5/5, 3/5, 5/5, 6/6.
+was fatal looked like an asymmetry four phases of single runs never surfaced:
+`GitHubError` and `ValueError` from the tools layer were believed to reach the
+model as a tool error it could read and route around, exactly as the prompts
+promise, while a raw `requests.ReadTimeout` escaped the agent loop and ended the
+run. `tools.py` now retries transport failures — and only transport failures,
+never an HTTP answer — then raises `GitHubError`, so a dropped connection is the
+same kind of event as a 404. Same four cases, unchanged, on the retry: 5/5, 3/5,
+5/5, 6/6.
+
+**And the belief in the middle of that paragraph was false.** A later run died on
+`GitHubError: 404` — one explorer asking for `requests/sessions.py` in a
+repository whose layout is `src/requests/sessions.py` — four agents and thirty
+requests deep, with a traceback. LangGraph's default tool-error handler returns a
+message for a schema error and **re-raises everything else**, so the careful
+error text in `tools.py` had never once reached a model. Both prompts had been
+promising the agents something the graph could not do.
+
+`SurfaceToolErrorsMiddleware` closes it: on the two agents that hold GitHub
+tools, outermost in each list, converting exactly those two exception types into
+a `ToolMessage` with `status="error"`. Not `Exception` — a `TypeError` from a bug
+in this project must still end the run, because handed to the model it becomes a
+paragraph the agent politely works around, and then a broken run and a good one
+produce the same shape of answer.
+
+Worth naming as its own lesson, because it is a third variety of the failure
+shape this section is about: **a claim in a docstring is not a mechanism.** The
+first two were things that succeeded somewhere useless. This one was a sentence
+everybody believed, restated in three files, describing behaviour nothing
+implemented.
 
 The point is not the bug. It is that the bug survived every phase in which
 verification meant watching a run, and died in the first sweep of a fixed set.

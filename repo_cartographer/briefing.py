@@ -107,6 +107,28 @@ _TREE_CACHE_MAX = 8
 # the two sides of it drift apart.
 _SCOPE = re.compile(r"""scope\s*[=:]\s*["'`]?([^\s"'`,]+)["'`]?""", re.IGNORECASE)
 
+# The fallback, and it earned its place on the first real run: the orchestrator
+# was asked for `owner=… repo=… scope=… notes=…` and wrote a brief without the
+# `scope=`. Both explorers then paid for their own file list and their own skill,
+# exactly as before, and nothing anywhere said so — the optimisation had simply
+# declined, silently, which is what it is designed to do.
+#
+# But the scope was in the brief twice. `ORCHESTRATOR_PROMPT` requires the notes
+# path to be `/notes/<scope>.md`, and the model wrote *that* reliably, because it
+# has four bullets of warnings attached to it and an explorer that cannot file
+# its notes without one. So a missing `scope=` is recoverable from the path it is
+# already agreed to be part of.
+#
+# A guess, though, and treated as one — see `Brief.derived`.
+_NOTES_PATH = re.compile(r"/notes/([\w.-]+)\.md", re.IGNORECASE)
+
+# `/notes/root.md` is the notes path `ORCHESTRATOR_PROMPT` names for the `"."`
+# scope, so a scope derived from that filename means the repository root and not
+# a directory called `root`. Kept as a mapping rather than folded into
+# `is_whole_repo`, because the two are different answers: `.` is the files *at*
+# the root, while the whole repository is every file there is.
+_DERIVED_SCOPE_ALIASES = {"root": ".", "repo": ".", "overview": "."}
+
 _TREE_CACHE: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
 
 
@@ -116,6 +138,19 @@ class Brief(NamedTuple):
     owner: str
     repo: str
     scope: str
+    derived: bool = False
+    """Whether `scope` was read from the brief or inferred from its notes path.
+
+    An inferred scope is checked before it is used: if it matches no files, the
+    inference was wrong and nothing is injected. A scope the orchestrator stated
+    outright gets the opposite treatment — an empty match is then a real fact
+    about the repository, and worth telling the explorer.
+
+    The distinction is the whole reason this field exists. Without it a bad guess
+    would reach the explorer as *"scope holds no files ... say so and stop"*,
+    which is a confident instruction to abandon a scope that may be full of the
+    code the run was asked about.
+    """
 
     @property
     def is_whole_repo(self) -> bool:
@@ -149,10 +184,18 @@ def parse_brief(text: str) -> Brief | None:
     if not (owner and repo):
         return None
 
-    scope = _SCOPE.search(text)
-    if not scope:
-        return None
-    return Brief(owner=owner, repo=repo, scope=scope.group(1).strip().strip("/"))
+    if stated := _SCOPE.search(text):
+        return Brief(owner=owner, repo=repo, scope=stated.group(1).strip().strip("/"))
+
+    if notes := _NOTES_PATH.search(text):
+        name = notes.group(1).strip().lower()
+        return Brief(
+            owner=owner,
+            repo=repo,
+            scope=_DERIVED_SCOPE_ALIASES.get(name, notes.group(1).strip()),
+            derived=True,
+        )
+    return None
 
 
 def cached_tree(owner: str, repo: str, ref: str = "HEAD") -> list[str] | None:
@@ -213,7 +256,15 @@ _LISTING_TEMPLATE = """
 This is every file in {where}, fetched from GitHub before you were started. It
 is complete for your scope and it is the same tree the orchestrator sized the
 repository up from, so **you do not need to call `get_repo_tree`** — spend the
-request on reading code instead. These are the only paths you may cite.
+request on reading code instead.
+
+**Copy paths from this list exactly, character for character**, both into
+`get_file_contents` and into your notes. Do not shorten one, do not reconstruct
+one from a module name, and do not assume a layout: `requests/sessions.py` and
+`src/requests/sessions.py` are the same module in two different project layouts,
+and only the one written below exists in this repository. A path you typed from
+memory instead of copying is a 404, which costs you a request and tells you
+nothing you could not have read here. These are also the only paths you may cite.
 
 ```
 {listing}
@@ -304,6 +355,11 @@ def briefing_for(text: str) -> str:
 
     paths = scoped_paths(tree, brief)
     if not paths:
+        if brief.derived:
+            # The scope was inferred from a notes filename and matched nothing,
+            # so the inference was wrong. Saying "this scope is empty" on the
+            # strength of a guess would send a perfectly good explorer home.
+            return ""
         return _EMPTY_SCOPE_TEMPLATE.format(
             scope=brief.scope, owner=brief.owner, repo=brief.repo
         )

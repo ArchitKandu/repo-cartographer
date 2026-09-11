@@ -661,13 +661,108 @@ one the instrument already reports, on a run nobody has made yet:
 uv run scripts/show_contexts.py
 ```
 
-Until then this section claims a design, not a result. Two things it should be
+### And then it was run, which is the only thing that settles any of it
+
+Two runs on `psf/requests` with `gemini-3.5-flash-lite`, and the first one is the
+more useful. It died — `GitHubError: 404` on `requests/sessions.py`, a path from
+the *pre-*`src/` layout of a repository whose files live under `src/requests/` —
+four agents and thirty requests deep, with a traceback. That failure had nothing
+to do with any of this and everything to do with the run: LangGraph's default
+tool-error handler re-raises anything that is not a schema error, so no error
+message this project writes had ever reached a model. See
+`SurfaceToolErrorsMiddleware` and the third failure mode in ARCHITECTURE.md;
+what matters here is that until it was fixed, none of the rest could be observed
+at all.
+
+The second run finished, 18 of 18 cited paths verified. What it showed:
+
+**Batching happens.** One message in the trace carries five calls —
+`read_file` plus four `get_file_contents`. That is the claim from the section
+above, and it is no longer a design.
+
+**The prefetch works, and it was silently not being used.** The first sign was an
+explorer reading files immediately with no `get_repo_tree` call — the listing had
+reached it. The second was another explorer calling `get_repo_tree` anyway, and
+the cause was not the middleware: probed directly with a brief in the mandated
+`owner=… repo=… scope=…` form, it injects 5,128 characters and the explorer skips
+both calls and finishes in four turns. The orchestrator had simply not written
+the `scope=` field it was asked for.
+
+Which is the failure this project keeps meeting from a new direction: **an
+optimisation designed to decline quietly declines quietly.** Nothing errored,
+nothing looked wrong, the run cost what it always cost. The repair uses the
+redundancy already in the brief — `ORCHESTRATOR_PROMPT` requires the notes path
+to be `/notes/<scope>.md`, and the model writes *that* reliably, so a missing
+`scope=` is recovered from the path it is already agreed to be part of. Marked as
+derived, and checked before it is used: a guess that matches no files injects
+nothing, because the alternative is telling a perfectly good explorer that its
+scope is empty on the authority of a filename.
+
+**One request per explorer is still being wasted, and the cause is a contest
+between two prompts.** The matched skill is spliced into the explorer's prompt
+with "do not `read_file` it" — and deepagents' own `SKILLS_SYSTEM_PROMPT`, in the
+same system message, says *"Read the skill's full instructions: use `read_file`
+on the path shown in the skill list above."* The model follows the library. The
+fix is to stop mounting the skills library on an agent that has already been
+handed the skill, which is a change to Phase 7's mechanism rather than to this
+one, and is therefore not made here.
+
+So: the retry cap and the second budget are arithmetic and hold. Batching is
+measured on one run. The prefetch is measured and partly leaking, for a reason
+that is now named. Two things it should be
 checked against when the run happens, because both would be invisible in an
 answer that still reads well: whether the injected file list pushed the
 explorer's own context up more than the two saved turns pulled it down, and
 whether an explorer told to batch reads four files it chose in advance rather
 than the four it would have chosen by following imports. The first is a token
 figure `show_contexts.py` prints. The second is what `run_evals.py` is for.
+
+### The other two levers: retries, and a second budget
+
+Two more changes followed from the same reading of the limit, and neither one
+removes a request.
+
+**The retries were spending the budget without asking.** `langchain-google-genai`
+defaults to `max_retries=6`, and every one of those six is a real request the
+provider counts — against the per-minute limit that caused the rejection, and
+against the per-day limit that had nothing to do with it. That is the explanation
+for a number that had been sitting in plain sight: the usage dashboard read **17
+requests in a minute against a limiter set to 12.** The limiter meters what we
+send; a retry storm inside the SDK is spend it never sees. Capped at 2, which the
+API's own advice on the original 429 — *"retry in 1.010311967s"* — is satisfied
+by, and which six does not improve on.
+
+**The limits are per model, not per project.** This was an outright error in
+`models.py`, which said the opposite in a comment and built one shared limiter on
+the strength of it. The dashboard is titled *Rate limits by model* and gives each
+model name its own RPM, TPM and RPD. So there was a second budget available the
+whole time, unspent, and the fix is one limiter per model rather than one per run
+— agents sharing a model still share a bucket, because the provider counts their
+requests together, but agents on different models no longer queue behind each
+other for nothing.
+
+That makes a second model worth having, and **the doc-writer is the agent that
+moves onto it.** Not because its output matters least — it produces the
+deliverable — but because it is the only agent whose failure mode this system
+already guards twice. Phase 4 took away its repository access entirely, so it
+cannot cite a file nobody read; Phase 6 then put an arithmetic check between its
+prose and the answer. A weaker model in that seat writes worse sentences and does
+not get to invent a file. Compare the orchestrator, whose regressions on a weaker
+model are parallel dispatch that stops being parallel, a brief the prefetch
+cannot read, and a guide summarised instead of relayed — three silent failures
+with no guard anywhere.
+
+It is worth being precise about what this buys, because it is easy to overclaim:
+**no request was saved.** Roughly five of a run's thirty stopped competing with
+the fan-out for the same bucket. That is capacity, and it is the only one of
+these three changes whose effect is arithmetic rather than a model decision.
+
+`scripts/show_models.py` prints the routing, the per-model budgets and the retry
+cap without spending a request — the counterpart to `show_contexts.py`, which
+reports what a run cost after the fact. This one reports what it is allowed to
+cost before it starts, because the routing is invisible in a transcript: a run
+whose doc-writer never left the primary model looks identical to one where it
+did.
 
 ---
 

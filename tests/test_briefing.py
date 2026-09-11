@@ -123,6 +123,42 @@ def test_an_incomplete_brief_is_no_brief(text: str) -> None:
     assert parse_brief(text) is None
 
 
+def test_a_missing_scope_is_recovered_from_the_notes_path() -> None:
+    """The fallback the first real run needed, and could not have been written without.
+
+    The orchestrator was asked for `owner=… repo=… scope=… notes=…` and wrote a
+    brief with no `scope=`. Both explorers then paid for their own file list and
+    their own skill, exactly as before, and nothing said so — the optimisation
+    declined silently, which is precisely what it is built to do.
+
+    But `ORCHESTRATOR_PROMPT` requires the notes path to be `/notes/<scope>.md`,
+    and *that* the model writes reliably: it has four bullets of warnings attached
+    and an explorer that cannot file its notes without one. So the scope is in the
+    brief twice, and the second copy is the one that survives a model's editing.
+    """
+    brief = parse_brief("Explore psf/requests. Focus on the src directory. Notes: /notes/src.md")
+    assert brief == Brief(owner="psf", repo="requests", scope="src", derived=True)
+
+
+def test_the_root_notes_file_means_the_root_scope() -> None:
+    """`/notes/root.md` is the prompt's name for the `"."` scope, not a directory.
+
+    And `.` is not the whole repository either — it is the files *at* the root.
+    Reading it as "everything" would hand a root-scoped explorer every path in
+    the repository, which is the one thing scope discipline exists to prevent.
+    """
+    brief = parse_brief("Explore psf/requests, the root manifests. Notes: /notes/root.md")
+    assert brief is not None
+    assert brief.scope == "."
+    assert brief.derived
+
+
+def test_a_stated_scope_beats_the_notes_path() -> None:
+    """When the orchestrator says what the scope is, that is not a guess."""
+    brief = parse_brief("owner=psf repo=requests scope=src notes=/notes/overview.md")
+    assert brief == Brief(owner="psf", repo="requests", scope="src", derived=False)
+
+
 def test_the_notes_path_is_not_mistaken_for_a_field() -> None:
     """`notes=/notes/src.md` sits next to `repo=`, and shares a word with it."""
     brief = parse_brief("owner=psf repo=requests scope=. notes=/notes/root.md")
@@ -308,6 +344,19 @@ def test_a_scope_too_large_to_inject_injects_no_listing(tree: Any) -> None:
     assert LISTING_HEADING not in section
     # The skill still is: matching a filename costs nothing at any repository size.
     assert SKILL_HEADING in section
+
+
+def test_a_guessed_scope_that_matches_nothing_says_nothing(tree: Any) -> None:
+    """A wrong guess must decline, not instruct.
+
+    `/notes/nonsense.md` yields the scope `nonsense`, which matches no files. The
+    stated-scope branch would answer *"this scope holds no files, say so and
+    stop"* — a confident instruction to abandon a scope, on the strength of a
+    filename. So a derived scope that matches nothing injects nothing at all, and
+    the explorer goes and looks for itself.
+    """
+    tree(PY_TREE)
+    assert briefing_for("Explore psf/requests and write to /notes/nonsense.md") == ""
 
 
 def test_an_empty_scope_is_said_out_loud(tree: Any) -> None:

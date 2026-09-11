@@ -72,8 +72,17 @@ from repo_cartographer.link_checker import (
     LINK_CHECKER_DESCRIPTION,
     build_link_checker,
 )
-from repo_cartographer.middleware import RestrictToolsMiddleware
-from repo_cartographer.models import MODEL_PROFILE_KEY, model
+from repo_cartographer.middleware import (
+    RestrictToolsMiddleware,
+    SurfaceToolErrorsMiddleware,
+)
+from repo_cartographer.models import (
+    DOC_WRITER,
+    EXPLORER,
+    model,
+    model_for,
+    profile_keys_in_use,
+)
 from repo_cartographer.prompts import (
     DOC_WRITER_PROMPT,
     EXPLORER_PROMPT,
@@ -131,12 +140,18 @@ _HOUSE_STYLE = house_style()
 # does not raise, it silently leaves the default sub-agent in place — so
 # `tests/test_wiring.py` asserts the menu, rather than trusting this call — and
 # `deepagents.profiles` is a documented beta API, so an upgrade could move it.
-register_harness_profile(
-    MODEL_PROFILE_KEY,
-    HarnessProfileConfig(
-        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-    ),
-)
+#
+# Registered for every model this run uses, not just the orchestrator's.
+# deepagents resolves a profile per model, so a run that routes the doc-writer to
+# a second model logs `No harness profile matched pre-built model ChatOpenAI`
+# unless that model's key is registered too. See `profile_keys_in_use`.
+for _profile_key in profile_keys_in_use():
+    register_harness_profile(
+        _profile_key,
+        HarnessProfileConfig(
+            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        ),
+    )
 
 
 def build_subagents(
@@ -178,6 +193,12 @@ def build_subagents(
     # to a type narrower than `SubAgent["middleware"]` accepts, and mypy rejects an
     # entry that is correct at run time.
     explorer_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        # First, and this is the agent it was written for. It holds all three
+        # GitHub tools and makes most of the requests, so it is where a 404 on
+        # one file used to end a four-agent run — see `middleware.py`. A bad path
+        # is now a message it can read, which is what both prompts already told
+        # it to expect.
+        SurfaceToolErrorsMiddleware(),
         FilesystemMiddleware(
             backend=backend,
             # `write_file` for its own notes, and `read_file` because eviction
@@ -238,6 +259,12 @@ def build_subagents(
                 "full, and the exact workspace path to write its notes to."
             ),
             "system_prompt": EXPLORER_PROMPT,
+            # Named rather than inherited, and it resolves to the primary model.
+            # This is the agent that decides which files to open and writes the
+            # notes every downstream claim rests on, and it makes more requests
+            # than the other two combined — so it is the last one to move onto a
+            # second-choice model, not the first. `models.py` has the argument.
+            "model": model_for(EXPLORER),
             "tools": [get_repo_tree, get_file_contents, search_code],
             "middleware": explorer_middleware,
             # Phase 7, and it goes on this agent alone. The explorer is the only
@@ -267,6 +294,15 @@ def build_subagents(
             "system_prompt": DOC_WRITER_PROMPT + HOUSE_STYLE_HEADER + _HOUSE_STYLE
             if _HOUSE_STYLE
             else DOC_WRITER_PROMPT,
+            # The one agent routed to the assist model when a second provider is
+            # configured, which buys the run a second per-minute budget. It is
+            # this one because it is the only agent whose failure mode the system
+            # already guards twice: it cannot reach the repository at all (the
+            # empty `tools` below), and Phase 6 checks every path it cites with no
+            # model involved. A weaker model here writes worse sentences; it does
+            # not get to invent a file. See `models.py` for why the orchestrator
+            # and the explorer are not candidates.
+            "model": model_for(DOC_WRITER),
             # Not an oversight, and not inheritance — the guarantee the whole
             # design rests on. An agent that cannot reach GitHub cannot cite a file
             # nobody read.
@@ -314,6 +350,12 @@ def build_agent(
     # than the parameter accepts and rejects entries that are perfectly valid at
     # run time. The annotation states the type the call actually wants.
     middleware: list[AgentMiddleware[Any, Any, Any]] = [
+        # First, so it is outermost: a tool error has to be caught outside every
+        # other middleware's `wrap_tool_call`, or it unwinds past the one place
+        # that could have handed it to the model. This agent holds
+        # `get_repo_scopes` and `open_pull_request`, and both raise `GitHubError`
+        # at a repository that does not exist or a branch that cannot be made.
+        SurfaceToolErrorsMiddleware(),
         # The planning tool (`write_todos`) is not part of deepagents' default
         # middleware stack as of 0.7.3 — the built-in suite is the filesystem
         # tools, `execute` and `task`. Watching the agent plan before it explores

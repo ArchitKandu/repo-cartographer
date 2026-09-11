@@ -79,11 +79,21 @@ def _get(url: str) -> requests.Response:
     **A retry that runs out raises `GitHubError`,** which matters more than it
     looks. Every failure this module already knows about — a rejected request, a
     directory passed as a file — surfaces as `GitHubError` or `ValueError`, and
-    those reach the model as a tool error it can read and route around; the
-    prompts tell it exactly that ("a failed tool call is information"). A raw
-    `requests.ReadTimeout` did not: it escaped the agent loop and ended the run.
-    A dropped connection is now the same kind of event as a 404 — a fact about
-    one call, not the end of the job.
+    the agent layer turns those two into a tool message the model can read and
+    route around; the prompts tell it exactly that ("a failed tool call is
+    information"). A raw `requests.ReadTimeout` did not: it escaped the agent loop
+    and ended the run. A dropped connection is now the same kind of event as a
+    404 — a fact about one call, not the end of the job.
+
+    One correction to that paragraph, because it was wrong for four phases and
+    the docstring said otherwise the whole time. Raising the right exception is
+    only half of it: LangGraph's default tool-error handler re-raises anything
+    that is not a schema error, so a `GitHubError` ended a run exactly as a
+    `ReadTimeout` did. `SurfaceToolErrorsMiddleware` in `middleware.py` is the
+    other half, and it is deliberately there rather than here — a tools layer
+    that returned its errors as strings could not be tested for them, and
+    `tests/test_tools.py` asserts these raises twenty-six times against real
+    repositories.
     """
     last: requests.RequestException | None = None
     for attempt in range(_ATTEMPTS):
